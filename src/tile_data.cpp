@@ -102,19 +102,20 @@ void TileDataSource::addObjectToSmallIndexUnsafe(const TileCoordinates& index, c
 	const size_t z6y = index.y / z6OffsetDivisor;
 	const size_t z6index = z6x * CLUSTER_ZOOM_WIDTH + z6y;
 
-	if (id == 0 || !includeID)
+	if (id == 0 || !includeID) {
 		objects[z6index].push_back({
 			oo,
 			(Z6Offset)(index.x - (z6x * z6OffsetDivisor)),
 			(Z6Offset)(index.y - (z6y * z6OffsetDivisor))
 		});
-	else
+	} else {
 		objectsWithIds[z6index].push_back({
 			oo,
 			(Z6Offset)(index.x - (z6x * z6OffsetDivisor)),
 			(Z6Offset)(index.y - (z6y * z6OffsetDivisor)),
 			id
 		});
+	}
 }
 
 void TileDataSource::collectTilesWithObjectsAtZoom(std::vector<std::shared_ptr<TileCoordinatesSet>>& zooms) {

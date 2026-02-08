@@ -325,6 +325,15 @@ private:
 
 	std::vector<OutputObject> finalizeOutputs();
 
+	// Extract coordinates from a POINT OutputObject (created via LayerAsCentroid)
+	LatpLon getPointFromOutputObject(const OutputObject& oo);
+
+	// Calculate buffer size based on name length for an object
+	double calculateBufferSize(const OutputObject& oo);
+
+	// Add point objects with buffering (used for LayerAsCentroid from ways/relations)
+	void addPointObjectsWithBuffering(const std::vector<OutputObject>& outputs, uint64_t osmId);
+
 	bool materializeGeometries;
 	bool wayEmitted;
 };

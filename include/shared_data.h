@@ -39,6 +39,7 @@ struct LayerDef {
 	std::string indexName;
 	std::map<std::string, uint> attributeMap; // string 0, number 1, bool 2
 	bool writeTo;
+	bool buffer;  // Enable label buffering for this layer
 	
 	const bool useColumn(std::string &col) {
 		return allSourceColumns || (std::find(sourceColumns.begin(), sourceColumns.end(), col) != sourceColumns.end());
@@ -66,7 +67,8 @@ public:
 			bool allSourceColumns,
 			bool indexed,
 			const std::string &indexName,
-			const std::string &writeTo);
+			const std::string &writeTo,
+			bool buffer = true);  // Default: buffering enabled
 	std::vector<bool> getSortOrders();
 	rapidjson::Value serialiseToJSONValue(rapidjson::Document::AllocatorType &allocator) const;
 	std::string serialiseToJSON() const;
@@ -85,6 +87,10 @@ public:
 	double minLon, minLat, maxLon, maxLat;
 	std::string projectName, projectVersion, projectDesc;
 	std::string defaultView;
+	uint labelBufferPixels;
+	uint labelBufferStartZoom;  // Minimum zoom level for label buffering
+	uint labelBufferNameMultiplier;  // Additional buffer per character of name
+	uint labelBufferMaxWidth;  // Maximum buffer size (prevents excessive buffering for very long names)
 
 	Config();
 	virtual ~Config();
