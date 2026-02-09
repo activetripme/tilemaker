@@ -331,11 +331,28 @@ private:
 	// Calculate buffer size based on name length for an object
 	double calculateBufferSize(const OutputObject& oo);
 
+	// Common buffering logic - adds a point to adjacent tiles when near boundaries
+	void bufferPointToAdjacentTiles(
+		const LatpLon& coords,
+		const OutputObject& output,
+		uint64_t osmId,
+		TileCoordinates mainIndex,
+		std::set<std::tuple<TileCoordinate, TileCoordinate, uint_least8_t>>& addedTiles);
+
 	// Add point objects with buffering (used for LayerAsCentroid from ways/relations)
 	void addPointObjectsWithBuffering(const std::vector<OutputObject>& outputs, uint64_t osmId);
 
+	// Inline helper: check if a layer has buffering enabled
+	inline bool isLayerBuffered(uint_least8_t layerNum) const {
+		return layerNum < layers.layers.size() && layers.layers[layerNum].buffer;
+	}
+
 	bool materializeGeometries;
 	bool wayEmitted;
+
+	// Statistics for debugging (enabled when verbose=true)
+	mutable uint64_t statsBufferedPointsAdded = 0;
+	mutable uint64_t statsBufferedDuplicatesSkipped = 0;
 };
 
 #endif //_OSM_LUA_PROCESSING_H

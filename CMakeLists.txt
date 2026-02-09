@@ -10,6 +10,14 @@ OPTION(TILEMAKER_BUILD_STATIC "Attempt to link dependencies static" OFF)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
+# Prevent in-source builds
+if("${PROJECT_SOURCE_DIR}" STREQUAL "${PROJECT_BINARY_DIR}")
+  message(FATAL_ERROR
+    "In-source builds are not allowed. Please create a separate build directory:\n"
+    "  mkdir build && cd build && cmake .."
+  )
+endif()
+
 if (POLICY CMP0074)
   cmake_policy(SET CMP0074 NEW)
 endif()

@@ -1085,14 +1085,8 @@ bool OsmLuaProcessing::setNode(NodeID id, LatpLon node, const TagMap& tags) {
 		TileCoordinates index = latpLon2index(node, osmMemTiles.getIndexZoom());
 
 		std::vector<OutputObject> outputs = finalizeOutputs();
-		const uint32_t maxTileIndex = (1 << osmMemTiles.getIndexZoom()) - 1;
 
-		// Buffer size in pixels - points within this distance from edge will be duplicated
-		// Configurable via "label_buffer_pixels" in JSON config (default: 0 = disabled)
-		const double bufferPixels = config.labelBufferPixels;
-
-		// Set to track which (tile, layer) combinations we've already added to avoid duplicates
-		// Using layer in the key allows different layers to add to the same tile
+		// Track which (tile, layer) combinations we've already added to avoid duplicates
 		std::set<std::tuple<TileCoordinate, TileCoordinate, uint_least8_t>> addedTiles;
 
 		for (auto &output : outputs) {
@@ -1101,66 +1095,9 @@ bool OsmLuaProcessing::setNode(NodeID id, LatpLon node, const TagMap& tags) {
 			uint_least8_t layer = output.layer;  // Copy bit-field to regular variable
 			addedTiles.insert({index.x, index.y, layer});
 
-			// Also add to adjacent tiles to prevent clipping at tile boundaries
-			// Check position at EACH zoom level independently
-			if (bufferPixels > 0 && output.layer < layers.layers.size() && layers.layers[output.layer].buffer) {
-				const uint startZoom = std::max({(uint)output.minZoom, config.startZoom, config.labelBufferStartZoom});
-				const uint maxCheckZoom = std::min(config.endZoom, (uint)osmMemTiles.getIndexZoom());
-
-				// Calculate dynamic buffer size based on name length
-				const double bufferSize = calculateBufferSize(output);
-
-				for (uint checkZoom = startZoom; checkZoom <= maxCheckZoom; checkZoom++) {
-					const double scaledBuffer = bufferSize;
-					const double tilexf = lon2tilexf(node.lon / 10000000.0, checkZoom);
-					const double tileyf = latp2tileyf(node.latp / 10000000.0, checkZoom);
-					const TileCoordinates checkIndex = {(TileCoordinate)tilexf, (TileCoordinate)tileyf};
-					const double xWithinTile = (tilexf - checkIndex.x) * 4096.0;
-					const double yWithinTile = (tileyf - checkIndex.y) * 4096.0;
-
-					const bool needLeft   = xWithinTile < scaledBuffer;
-					const bool needRight  = xWithinTile > (4096.0 - scaledBuffer);
-					const bool needTop    = yWithinTile < scaledBuffer;
-					const bool needBottom = yWithinTile > (4096.0 - scaledBuffer);
-
-					if (!needLeft && !needRight && !needTop && !needBottom)
-						continue;
-
-					for (int dx = -1; dx <= 1; dx++) {
-						for (int dy = -1; dy <= 1; dy++) {
-							if (dx == 0 && dy == 0) continue;
-							if (dx == -1 && !needLeft) continue;
-							if (dx ==  1 && !needRight) continue;
-							if (dy == -1 && !needTop) continue;
-							if (dy ==  1 && !needBottom) continue;
-
-							const TileCoordinate neighborX = checkIndex.x + dx;
-							const TileCoordinate neighborY = checkIndex.y + dy;
-							const int scale = 1 << (osmMemTiles.getIndexZoom() - checkZoom);
-							const TileCoordinate indexStartX = neighborX * scale;
-							const TileCoordinate indexStartY = neighborY * scale;
-
-							for (TileCoordinate ix = indexStartX; ix < indexStartX + scale; ix++) {
-								for (TileCoordinate iy = indexStartY; iy < indexStartY + scale; iy++) {
-									const int64_t diffX = (int64_t)ix - (int64_t)index.x;
-									const int64_t diffY = (int64_t)iy - (int64_t)index.y;
-
-									if (abs(diffX) <= 1 && abs(diffY) <= 1 && (diffX != 0 || diffY != 0)) {
-										if (ix >= 0 && ix <= maxTileIndex && iy >= 0 && iy <= maxTileIndex) {
-											uint_least8_t layer = output.layer;
-											auto key = std::make_tuple(ix, iy, layer);
-											if (addedTiles.find(key) == addedTiles.end()) {
-												TileCoordinates neighbor = {ix, iy};
-												osmMemTiles.addObjectToSmallIndex(neighbor, output, originalOsmID);
-												addedTiles.insert(key);
-											}
-										}
-									}
-								}
-							}
-						}
-					}
-				}
+			// Apply buffering if enabled
+			if (config.labelBufferPixels > 0) {
+				bufferPointToAdjacentTiles(node, output, originalOsmID, index, addedTiles);
 			}
 		}
 
@@ -1238,7 +1175,89 @@ double OsmLuaProcessing::calculateBufferSize(const OutputObject& oo) {
 	return bufferSize;
 }
 
-// Add point objects with buffering (similar to setNode logic)
+// Common buffering logic - adds a point to adjacent tiles when near boundaries
+// This is shared between setNode() and addPointObjectsWithBuffering() to avoid code duplication
+void OsmLuaProcessing::bufferPointToAdjacentTiles(
+	const LatpLon& coords,
+	const OutputObject& output,
+	uint64_t osmId,
+	TileCoordinates mainIndex,
+	std::set<std::tuple<TileCoordinate, TileCoordinate, uint_least8_t>>& addedTiles
+) {
+	if (!isLayerBuffered(output.layer)) {
+		return;
+	}
+
+	const uint32_t maxTileIndex = (1 << osmMemTiles.getIndexZoom()) - 1;
+	const uint startZoom = std::max({(uint)output.minZoom, config.startZoom, config.labelBufferStartZoom});
+	const uint maxCheckZoom = std::min(config.endZoom, (uint)osmMemTiles.getIndexZoom());
+	const double bufferSize = calculateBufferSize(output);
+	const uint_least8_t layer = output.layer;
+
+	// Check position at EACH zoom level independently
+	for (uint checkZoom = startZoom; checkZoom <= maxCheckZoom; checkZoom++) {
+		const double tilexf = lon2tilexf(coords.lon / 10000000.0, checkZoom);
+		const double tileyf = latp2tileyf(coords.latp / 10000000.0, checkZoom);
+		const TileCoordinates checkIndex = {(TileCoordinate)tilexf, (TileCoordinate)tileyf};
+		const double xWithinTile = (tilexf - checkIndex.x) * TILE_EXTENT_STANDARD;
+		const double yWithinTile = (tileyf - checkIndex.y) * TILE_EXTENT_STANDARD;
+
+		const bool needLeft   = xWithinTile < bufferSize;
+		const bool needRight  = xWithinTile > (TILE_EXTENT_STANDARD - bufferSize);
+		const bool needTop    = yWithinTile < bufferSize;
+		const bool needBottom = yWithinTile > (TILE_EXTENT_STANDARD - bufferSize);
+
+		if (!needLeft && !needRight && !needTop && !needBottom)
+			continue;
+
+		// Iterate over all 8 possible neighbors
+		for (int dx = -1; dx <= 1; dx++) {
+			for (int dy = -1; dy <= 1; dy++) {
+				if (dx == 0 && dy == 0) continue;
+				if (dx == -1 && !needLeft) continue;
+				if (dx ==  1 && !needRight) continue;
+				if (dy == -1 && !needTop) continue;
+				if (dy ==  1 && !needBottom) continue;
+
+				const TileCoordinate neighborX = checkIndex.x + dx;
+				const TileCoordinate neighborY = checkIndex.y + dy;
+				const int scale = 1 << (osmMemTiles.getIndexZoom() - checkZoom);
+				const TileCoordinate indexStartX = neighborX * scale;
+				const TileCoordinate indexStartY = neighborY * scale;
+
+				// Iterate over ALL tiles in the range (this was missing in the "optimized" version)
+				for (TileCoordinate ix = indexStartX; ix < indexStartX + scale; ix++) {
+					for (TileCoordinate iy = indexStartY; iy < indexStartY + scale; iy++) {
+						const int64_t diffX = (int64_t)ix - (int64_t)mainIndex.x;
+						const int64_t diffY = (int64_t)iy - (int64_t)mainIndex.y;
+
+						if (std::abs(diffX) <= 1 && std::abs(diffY) <= 1 && (diffX != 0 || diffY != 0)) {
+							if (ix >= 0 && ix <= maxTileIndex && iy >= 0 && iy <= maxTileIndex) {
+								auto key = std::make_tuple(ix, iy, layer);
+								if (addedTiles.find(key) == addedTiles.end()) {
+									TileCoordinates neighbor = {ix, iy};
+									osmMemTiles.addObjectToSmallIndex(neighbor, output, osmId);
+									addedTiles.insert(key);
+									statsBufferedPointsAdded++;
+
+#ifdef DEBUG_BUFFER
+									std::cout << "Buffered point osmId=" << osmId
+									          << " to tile (" << ix << "," << iy
+									          << ") from main tile (" << mainIndex.x << "," << mainIndex.y << ")" << std::endl;
+#endif
+								} else {
+									statsBufferedDuplicatesSkipped++;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// Add point objects with buffering (used for LayerAsCentroid from ways/relations)
 void OsmLuaProcessing::addPointObjectsWithBuffering(
 	const std::vector<OutputObject>& outputs,
 	uint64_t osmId
@@ -1253,10 +1272,7 @@ void OsmLuaProcessing::addPointObjectsWithBuffering(
 		return;
 	}
 
-	const uint32_t maxTileIndex = (1 << osmMemTiles.getIndexZoom()) - 1;
-
 	// Track which (tile, layer) combinations have been added to avoid duplicates
-	// Using layer in the key allows different layers to add to the same tile
 	std::set<std::tuple<TileCoordinate, TileCoordinate, uint_least8_t>> addedTiles;
 
 	for (const auto& oo : outputs) {
@@ -1266,68 +1282,11 @@ void OsmLuaProcessing::addPointObjectsWithBuffering(
 
 		// Add to the main tile
 		osmMemTiles.addObjectToSmallIndex(index, oo, osmId);
-		addedTiles.insert({index.x, index.y, oo.layer});
+		uint_least8_t layer = oo.layer;
+		addedTiles.insert({index.x, index.y, layer});
 
-		// Apply buffering logic
-		if (oo.layer < layers.layers.size() && layers.layers[oo.layer].buffer) {
-			const uint startZoom = std::max({(uint)oo.minZoom, config.startZoom, config.labelBufferStartZoom});
-			const uint maxCheckZoom = std::min(config.endZoom, (uint)osmMemTiles.getIndexZoom());
-
-			// Calculate dynamic buffer size based on name length
-			const double bufferSize = calculateBufferSize(oo);
-
-			for (uint checkZoom = startZoom; checkZoom <= maxCheckZoom; checkZoom++) {
-				const double scaledBuffer = bufferSize;
-				const double tilexf = lon2tilexf(coords.lon / 10000000.0, checkZoom);
-				const double tileyf = latp2tileyf(coords.latp / 10000000.0, checkZoom);
-				const TileCoordinates checkIndex = {(TileCoordinate)tilexf, (TileCoordinate)tileyf};
-				const double xWithinTile = (tilexf - checkIndex.x) * 4096.0;
-				const double yWithinTile = (tileyf - checkIndex.y) * 4096.0;
-
-				const bool needLeft   = xWithinTile < scaledBuffer;
-				const bool needRight  = xWithinTile > (4096.0 - scaledBuffer);
-				const bool needTop    = yWithinTile < scaledBuffer;
-				const bool needBottom = yWithinTile > (4096.0 - scaledBuffer);
-
-				if (!needLeft && !needRight && !needTop && !needBottom)
-					continue;
-
-				for (int dx = -1; dx <= 1; dx++) {
-					for (int dy = -1; dy <= 1; dy++) {
-						if (dx == 0 && dy == 0) continue;
-						if (dx == -1 && !needLeft) continue;
-						if (dx ==  1 && !needRight) continue;
-						if (dy == -1 && !needTop) continue;
-						if (dy ==  1 && !needBottom) continue;
-
-						const TileCoordinate neighborX = checkIndex.x + dx;
-						const TileCoordinate neighborY = checkIndex.y + dy;
-						const int scale = 1 << (osmMemTiles.getIndexZoom() - checkZoom);
-						const TileCoordinate indexStartX = neighborX * scale;
-						const TileCoordinate indexStartY = neighborY * scale;
-
-						for (TileCoordinate ix = indexStartX; ix < indexStartX + scale; ix++) {
-							for (TileCoordinate iy = indexStartY; iy < indexStartY + scale; iy++) {
-								const int64_t diffX = (int64_t)ix - (int64_t)index.x;
-								const int64_t diffY = (int64_t)iy - (int64_t)index.y;
-
-								if (abs(diffX) <= 1 && abs(diffY) <= 1 && (diffX != 0 || diffY != 0)) {
-									if (ix >= 0 && ix <= maxTileIndex && iy >= 0 && iy <= maxTileIndex) {
-										uint_least8_t layer = oo.layer;
-										auto key = std::make_tuple(ix, iy, layer);
-										if (addedTiles.find(key) == addedTiles.end()) {
-											TileCoordinates neighbor = {ix, iy};
-											osmMemTiles.addObjectToSmallIndex(neighbor, oo, osmId);
-											addedTiles.insert(key);
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
+		// Apply buffering logic using common function
+		bufferPointToAdjacentTiles(coords, oo, osmId, index, addedTiles);
 	}
 }
 
