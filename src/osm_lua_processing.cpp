@@ -1,4 +1,5 @@
 #include <iostream>
+#include <set>
 
 #include "osm_lua_processing.h"
 #include "attribute_store.h"
@@ -1083,14 +1084,210 @@ bool OsmLuaProcessing::setNode(NodeID id, LatpLon node, const TagMap& tags) {
 	if (!this->empty()) {
 		TileCoordinates index = latpLon2index(node, osmMemTiles.getIndexZoom());
 
-		for (auto &output : finalizeOutputs()) {
+		std::vector<OutputObject> outputs = finalizeOutputs();
+
+		// Track which (tile, layer) combinations we've already added to avoid duplicates
+		std::set<std::tuple<TileCoordinate, TileCoordinate, uint_least8_t>> addedTiles;
+
+		for (auto &output : outputs) {
+			// Add to the main tile
 			osmMemTiles.addObjectToSmallIndex(index, output, originalOsmID);
+			uint_least8_t layer = output.layer;  // Copy bit-field to regular variable
+			addedTiles.insert({index.x, index.y, layer});
+
+			// Apply buffering if enabled
+			if (config.labelBufferPixels > 0) {
+				bufferPointToAdjacentTiles(node, output, originalOsmID, index, addedTiles);
+			}
 		}
 
 		return true;
 	}
 
 	return false;
+}
+
+// Extract coordinates from a POINT OutputObject (created via LayerAsCentroid)
+LatpLon OsmLuaProcessing::getPointFromOutputObject(const OutputObject& oo) {
+	// Handle different types of stored point geometries
+	NodeID id = oo.objectID;
+
+	// Case 1: Point stored in generated geometry store
+	if (!IS_NODE(id) && !IS_WAY(id)) {
+		const Point& pt = osmMemTiles.retrievePoint(id);
+		return LatpLon { static_cast<int32_t>(pt.y()), static_cast<int32_t>(pt.x()) }; // latp, lon
+	}
+
+	// Case 2: Reference to original OSM node
+	if (IS_NODE(id)) {
+		NodeID nodeId = OSM_ID(id);
+		const auto ll = osmStore.nodes.at(nodeId);
+		return ll;
+	}
+
+	// Case 3: Lazy way geometry - compute centroid on the fly
+	if (IS_WAY(id)) {
+		Point centroid;
+		if (isRelation) {
+			MultiPolygon mp = multiPolygonCached();
+			geom::centroid(mp, centroid);
+		} else {
+			Polygon p;
+			geom::assign_points(p, linestringCached());
+			geom::centroid(p, centroid);
+		}
+		return LatpLon { static_cast<int32_t>(centroid.y()), static_cast<int32_t>(centroid.x()) }; // latp, lon
+	}
+
+	throw std::runtime_error("Unable to extract point coordinates from OutputObject");
+}
+
+// Calculate buffer size based on name length for an object
+double OsmLuaProcessing::calculateBufferSize(const OutputObject& oo) {
+	// Start with base buffer size
+	double bufferSize = static_cast<double>(config.labelBufferPixels);
+
+	// If name-based multiplier is not set, return base buffer
+	if (config.labelBufferNameMultiplier == 0) {
+		return bufferSize;
+	}
+
+	// Get attributes for this object
+	std::vector<const AttributePair*> attributes = attributeStore.getUnsafe(oo.attributes);
+
+	// Find the 'name' attribute
+	for (const auto* attr : attributes) {
+		std::string key = attributeStore.keyStore.getKeyUnsafe(attr->keyIndex);
+		if (key == "name" && attr->valueType == AttributePairType::String) {
+			// Calculate additional buffer based on name length
+			size_t nameLength = attr->stringValue_.size();
+			double additionalBuffer = static_cast<double>(nameLength) * config.labelBufferNameMultiplier;
+			bufferSize += additionalBuffer;
+
+			// Apply maximum limit if set
+			if (config.labelBufferMaxWidth > 0) {
+				bufferSize = std::min(bufferSize, static_cast<double>(config.labelBufferMaxWidth));
+			}
+			break;
+		}
+	}
+
+	return bufferSize;
+}
+
+// Common buffering logic - adds a point to adjacent tiles when near boundaries
+// This is shared between setNode() and addPointObjectsWithBuffering() to avoid code duplication
+void OsmLuaProcessing::bufferPointToAdjacentTiles(
+	const LatpLon& coords,
+	const OutputObject& output,
+	uint64_t osmId,
+	TileCoordinates mainIndex,
+	std::set<std::tuple<TileCoordinate, TileCoordinate, uint_least8_t>>& addedTiles
+) {
+	if (!isLayerBuffered(output.layer)) {
+		return;
+	}
+
+	const uint32_t maxTileIndex = (1 << osmMemTiles.getIndexZoom()) - 1;
+	const uint startZoom = std::max({(uint)output.minZoom, config.startZoom, config.labelBufferStartZoom});
+	const uint maxCheckZoom = std::min(config.endZoom, (uint)osmMemTiles.getIndexZoom());
+	const double bufferSize = calculateBufferSize(output);
+	const uint_least8_t layer = output.layer;
+
+	// Check position at EACH zoom level independently
+	for (uint checkZoom = startZoom; checkZoom <= maxCheckZoom; checkZoom++) {
+		const double tilexf = lon2tilexf(coords.lon / 10000000.0, checkZoom);
+		const double tileyf = latp2tileyf(coords.latp / 10000000.0, checkZoom);
+		const TileCoordinates checkIndex = {(TileCoordinate)tilexf, (TileCoordinate)tileyf};
+		const double xWithinTile = (tilexf - checkIndex.x) * TILE_EXTENT_STANDARD;
+		const double yWithinTile = (tileyf - checkIndex.y) * TILE_EXTENT_STANDARD;
+
+		const bool needLeft   = xWithinTile < bufferSize;
+		const bool needRight  = xWithinTile > (TILE_EXTENT_STANDARD - bufferSize);
+		const bool needTop    = yWithinTile < bufferSize;
+		const bool needBottom = yWithinTile > (TILE_EXTENT_STANDARD - bufferSize);
+
+		if (!needLeft && !needRight && !needTop && !needBottom)
+			continue;
+
+		// Iterate over all 8 possible neighbors
+		for (int dx = -1; dx <= 1; dx++) {
+			for (int dy = -1; dy <= 1; dy++) {
+				if (dx == 0 && dy == 0) continue;
+				if (dx == -1 && !needLeft) continue;
+				if (dx ==  1 && !needRight) continue;
+				if (dy == -1 && !needTop) continue;
+				if (dy ==  1 && !needBottom) continue;
+
+				const TileCoordinate neighborX = checkIndex.x + dx;
+				const TileCoordinate neighborY = checkIndex.y + dy;
+				const int scale = 1 << (osmMemTiles.getIndexZoom() - checkZoom);
+				const TileCoordinate indexStartX = neighborX * scale;
+				const TileCoordinate indexStartY = neighborY * scale;
+
+				// Iterate over ALL tiles in the range (this was missing in the "optimized" version)
+				for (TileCoordinate ix = indexStartX; ix < indexStartX + scale; ix++) {
+					for (TileCoordinate iy = indexStartY; iy < indexStartY + scale; iy++) {
+						const int64_t diffX = (int64_t)ix - (int64_t)mainIndex.x;
+						const int64_t diffY = (int64_t)iy - (int64_t)mainIndex.y;
+
+						if (std::abs(diffX) <= 1 && std::abs(diffY) <= 1 && (diffX != 0 || diffY != 0)) {
+							if (ix >= 0 && ix <= maxTileIndex && iy >= 0 && iy <= maxTileIndex) {
+								auto key = std::make_tuple(ix, iy, layer);
+								if (addedTiles.find(key) == addedTiles.end()) {
+									TileCoordinates neighbor = {ix, iy};
+									osmMemTiles.addObjectToSmallIndex(neighbor, output, osmId);
+									addedTiles.insert(key);
+									statsBufferedPointsAdded++;
+
+#ifdef DEBUG_BUFFER
+									std::cout << "Buffered point osmId=" << osmId
+									          << " to tile (" << ix << "," << iy
+									          << ") from main tile (" << mainIndex.x << "," << mainIndex.y << ")" << std::endl;
+#endif
+								} else {
+									statsBufferedDuplicatesSkipped++;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// Add point objects with buffering (used for LayerAsCentroid from ways/relations)
+void OsmLuaProcessing::addPointObjectsWithBuffering(
+	const std::vector<OutputObject>& outputs,
+	uint64_t osmId
+) {
+	if (config.labelBufferPixels == 0) {
+		// No buffering - just add to main tile
+		for (const auto& oo : outputs) {
+			LatpLon coords = getPointFromOutputObject(oo);
+			TileCoordinates index = latpLon2index(coords, osmMemTiles.getIndexZoom());
+			osmMemTiles.addObjectToSmallIndex(index, oo, osmId);
+		}
+		return;
+	}
+
+	// Track which (tile, layer) combinations have been added to avoid duplicates
+	std::set<std::tuple<TileCoordinate, TileCoordinate, uint_least8_t>> addedTiles;
+
+	for (const auto& oo : outputs) {
+		// Get coordinates for this point
+		LatpLon coords = getPointFromOutputObject(oo);
+		TileCoordinates index = latpLon2index(coords, osmMemTiles.getIndexZoom());
+
+		// Add to the main tile
+		osmMemTiles.addObjectToSmallIndex(index, oo, osmId);
+		uint_least8_t layer = oo.layer;
+		addedTiles.insert({index.x, index.y, layer});
+
+		// Apply buffering logic using common function
+		bufferPointToAdjacentTiles(coords, oo, osmId, index, addedTiles);
+	}
 }
 
 // We are now processing a way
@@ -1133,7 +1330,29 @@ bool OsmLuaProcessing::setWay(WayID wayId, LatpLonVec const &llVec, const TagMap
 	}
 
 	if (!this->empty()) {
-		osmMemTiles.addGeometryToIndex(linestringCached(), finalizeOutputs(), originalOsmID);
+		std::vector<OutputObject> outputs = finalizeOutputs();
+
+		// Separate POINT objects (from LayerAsCentroid) for buffered indexing
+		std::vector<OutputObject> pointOutputs;
+		std::vector<OutputObject> geometryOutputs;
+		for (const auto& oo : outputs) {
+			if (oo.geomType == POINT_) {
+				pointOutputs.push_back(oo);
+			} else {
+				geometryOutputs.push_back(oo);
+			}
+		}
+
+		// Handle geometry objects with normal indexing
+		if (!geometryOutputs.empty()) {
+			osmMemTiles.addGeometryToIndex(linestringCached(), geometryOutputs, originalOsmID);
+		}
+
+		// Handle POINT objects with buffered indexing
+		if (!pointOutputs.empty()) {
+			addPointObjectsWithBuffering(pointOutputs, originalOsmID);
+		}
+
 		return wayEmitted;
 	}
 
@@ -1181,15 +1400,35 @@ void OsmLuaProcessing::setRelation(
 	if (this->empty()) return;
 
 	try {
-		if (isClosed) {
-			std::vector<OutputObject> objects = finalizeOutputs();
-			osmMemTiles.addGeometryToIndex(multiPolygonCached(), objects, originalOsmID);
-		} else {
-			osmMemTiles.addGeometryToIndex(multiLinestringCached(), finalizeOutputs(), originalOsmID);
+		std::vector<OutputObject> outputs = finalizeOutputs();
+
+		// Separate POINT objects (from LayerAsCentroid) for buffered indexing
+		std::vector<OutputObject> pointOutputs;
+		std::vector<OutputObject> geometryOutputs;
+		for (const auto& oo : outputs) {
+			if (oo.geomType == POINT_) {
+				pointOutputs.push_back(oo);
+			} else {
+				geometryOutputs.push_back(oo);
+			}
+		}
+
+		// Handle geometry objects with normal indexing
+		if (!geometryOutputs.empty()) {
+			if (isClosed) {
+				osmMemTiles.addGeometryToIndex(multiPolygonCached(), geometryOutputs, originalOsmID);
+			} else {
+				osmMemTiles.addGeometryToIndex(multiLinestringCached(), geometryOutputs, originalOsmID);
+			}
+		}
+
+		// Handle POINT objects with buffered indexing
+		if (!pointOutputs.empty()) {
+			addPointObjectsWithBuffering(pointOutputs, originalOsmID);
 		}
 	} catch(std::out_of_range &err) {
 		cout << "In relation " << originalOsmID << ": " << err.what() << endl;
-	}		
+	}
 }
 
 SignificantTags OsmLuaProcessing::GetSignificantNodeKeys() {

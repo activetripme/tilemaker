@@ -7,6 +7,11 @@
 
 #define Z_DEFAULT_COMPRESSION -1
 
+// Vector tile extent constants (per Mapbox Vector Tile specification)
+// Standard extent is 4096, with hires mode using 8192
+constexpr uint32_t TILE_EXTENT_STANDARD = 4096;
+constexpr uint32_t TILE_EXTENT_HIRES = 8192;
+
 #ifdef _MSVC_LANG
 #define ISATTY true
 #else

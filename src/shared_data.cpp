@@ -146,13 +146,14 @@ uint LayerDefinition::addLayer(string name, uint minzoom, uint maxzoom,
 		bool allSourceColumns,
 		bool indexed,
 		const std::string &indexName,
-		const std::string &writeTo)  {
+		const std::string &writeTo,
+		bool buffer)  {
 
 	bool isWriteTo = !writeTo.empty();
 	LayerDef layer = { name, minzoom, maxzoom, simplifyBelow, simplifyLevel, simplifyLength, simplifyRatio, simplifyAlgo,
 		filterBelow, filterArea, sortZOrderAscending, featureLimit, featureLimitBelow, combinePoints, combineLinesBelow, combinePolygonsBelow,
 		source, sourceColumns, allSourceColumns, indexed, indexName,
-		std::map<std::string,uint>(), isWriteTo };
+		std::map<std::string,uint>(), isWriteTo, buffer };
 	layers.push_back(layer);
 	uint layerNum = layers.size()-1;
 	layerMap[name] = layerNum;
@@ -230,6 +231,10 @@ Config::Config() {
 	clippingBoxFromJSON = false;
 	baseZoom = 0;
 	combineBelow = 0;
+	labelBufferPixels = 0;  // Default: disabled (0)
+	labelBufferStartZoom = 0;  // Default: start from startZoom
+	labelBufferNameMultiplier = 0;  // Default: disabled (0 = no name-based buffer)
+	labelBufferMaxWidth = 0;  // Default: no maximum (0 = unlimited)
 }
 
 Config::~Config() { }
@@ -266,6 +271,10 @@ void Config::readConfig(rapidjson::Document &jsonConfig, bool &hasClippingBox, B
 	compressOpt    = jsonConfig["settings"]["compress"].GetString();
 	combineBelow   = jsonConfig["settings"].HasMember("combine_below") ? jsonConfig["settings"]["combine_below"].GetUint() : 0;
 	mvtVersion     = jsonConfig["settings"].HasMember("mvt_version") ? jsonConfig["settings"]["mvt_version"].GetUint() : 2;
+	labelBufferPixels = jsonConfig["settings"].HasMember("label_buffer_pixels") ? jsonConfig["settings"]["label_buffer_pixels"].GetUint() : 0;
+	labelBufferStartZoom = jsonConfig["settings"].HasMember("label_buffer_start_zoom") ? jsonConfig["settings"]["label_buffer_start_zoom"].GetUint() : 0;
+	labelBufferNameMultiplier = jsonConfig["settings"].HasMember("label_buffer_name_multiplier") ? jsonConfig["settings"]["label_buffer_name_multiplier"].GetUint() : 0;
+	labelBufferMaxWidth = jsonConfig["settings"].HasMember("label_buffer_max_width") ? jsonConfig["settings"]["label_buffer_max_width"].GetUint() : 0;
 	projectName    = jsonConfig["settings"]["name"].GetString();
 	projectVersion = jsonConfig["settings"]["version"].GetString();
 	projectDesc    = jsonConfig["settings"]["description"].GetString();
@@ -341,12 +350,13 @@ void Config::readConfig(rapidjson::Document &jsonConfig, bool &hasClippingBox, B
 			indexed=it->value["index"].GetBool();
 		}
 		string indexName = it->value.HasMember("index_column") ? it->value["index_column"].GetString() : "";
+		bool buffer = it->value.HasMember("buffer") ? it->value["buffer"].GetBool() : true;  // Default: true
 
 		layers.addLayer(layerName, minZoom, maxZoom,
 				simplifyBelow, simplifyLevel, simplifyLength, simplifyRatio, simplifyAlgo,
 				filterBelow, filterArea, sortZOrderAscending, featureLimit, featureLimitBelow, combinePoints, combineLinesBelow, combinePolyBelow,
 				source, sourceColumns, allSourceColumns, indexed, indexName,
-				writeTo);
+				writeTo, buffer);
 
 		cout << "Layer " << layerName << " (z" << minZoom << "-" << maxZoom << ")";
 		if (it->value.HasMember("write_to")) { cout << " -> " << it->value["write_to"].GetString(); }

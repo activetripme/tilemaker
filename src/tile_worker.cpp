@@ -291,7 +291,6 @@ void ProcessObjects(
 		if (oo.oo.geomType == POINT_) {
 			// The very first point; below we check if there are more compatible points
 			// so that we can write a multipoint instead of many point features
-
 			std::vector<std::pair<int, int>> multipoint;
 
 			LatpLon pos = source->buildNodeGeometry(jt->oo.objectID, bbox);
@@ -314,7 +313,9 @@ void ProcessObjects(
 				std::cout << "Merging " << multipoint.size() << " points into a multipoint" << std::endl;
 
 			for (const auto &point : multipoint)
+			{
 				fbuilder.set_point(point.first, point.second);
+			}
 
 			oo.oo.writeAttributes(attributeStore, fbuilder, zoom);
 			fbuilder.commit();
@@ -400,7 +401,12 @@ void ProcessLayer(
 	SharedData& sharedData
 ) {
 	std::string layerName = sharedData.layers.layers[ltx.at(0)].name;
-	vtzero::layer_builder vtLayer{tile, layerName, sharedData.config.mvtVersion, bbox.hires ? 8192u : 4096u};
+	uint8_t layerNum = ltx.at(0);
+
+	// Use extent=8192 to allow buffering with negative coordinates
+	// This prevents vtzero from dropping points near tile boundaries
+	uint32_t extent = 8192u;
+	vtzero::layer_builder vtLayer{tile, layerName, sharedData.config.mvtVersion, extent};
 
 	vtzero::layer existingLayer = existingTile.get_layer_by_name(layerName);
 	if (existingLayer) {
@@ -437,16 +443,17 @@ void ProcessLayer(
 			}
 			simplifyLevel *= pow(ld.simplifyRatio, (ld.simplifyBelow-1) - zoom);
 		}
-		if (zoom < ld.filterBelow) { 
+		if (zoom < ld.filterBelow) {
 			filterArea = meter2degp(ld.filterArea, latp) * pow(2.0, (ld.filterBelow-1) - zoom);
 		}
 		for (size_t i=0; i<sources.size(); i++) {
 			// Loop through output objects
 			auto ooListSameLayer = getObjectsAtSubLayer(data[i], layerNum);
 			auto end = ooListSameLayer.second;
+
 			if (ld.featureLimit>0 && end-ooListSameLayer.first>ld.featureLimit && zoom<ld.featureLimitBelow) end = ooListSameLayer.first+ld.featureLimit;
-			ProcessObjects(sources[i], attributeStore, 
-				ooListSameLayer.first, end, sharedData, 
+			ProcessObjects(sources[i], attributeStore,
+				ooListSameLayer.first, end, sharedData,
 				simplifyLevel, ld.simplifyAlgo,
 				filterArea, ld.combinePoints, zoom < ld.combineLinesBelow, zoom < ld.combinePolygonsBelow, zoom, bbox, vtLayer);
 		}
@@ -473,7 +480,8 @@ void outputProc(
 	// Create tile
 	vtzero::tile_builder tile;
 
-	TileBbox bbox(coordinates, zoom, sharedData.config.highResolution && zoom==sharedData.config.endZoom, zoom==sharedData.config.endZoom);
+	// Use hires=true for extent=8192 to support negative coordinates from buffering
+	TileBbox bbox(coordinates, zoom, true, zoom==sharedData.config.endZoom);
 	if (sharedData.config.clippingBoxFromJSON && (
 			sharedData.config.maxLon <= bbox.minLon ||
 			sharedData.config.minLon >= bbox.maxLon ||

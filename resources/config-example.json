@@ -16,6 +16,65 @@
 		"name": "Tilemaker example",
 		"version": "0.1",
 		"description": "Sample vector tiles for Tilemaker",
-		"compress": "gzip"
+		"compress": "gzip",
+
+		"___Label_Bufffering_Options___": "See documentation below",
+		"label_buffer_pixels": 64,
+		"label_buffer_start_zoom": 10,
+		"label_buffer_name_multiplier": 3,
+		"label_buffer_max_width": 200
 	}
 }
+
+/*
+ * Label Buffering Configuration
+ * ==============================
+ *
+ * These settings control label buffering to prevent text clipping at tile boundaries.
+ * When enabled, point features (nodes, place centroids) are duplicated to adjacent tiles
+ * when they appear within the buffer distance of a tile edge.
+ *
+ * Setting: label_buffer_pixels (default: 0 = disabled)
+ *   - Base buffer size in pixels (extent is 4096 pixels per tile)
+ *   - Points within this distance from tile edge will be duplicated
+ *   - Recommended values: 32-128 depending on font size
+ *   - Set to 0 to disable buffering entirely
+ *
+ * Setting: label_buffer_start_zoom (default: 0 = start from minzoom)
+ *   - Minimum zoom level at which buffering is applied
+ *   - Lower zoom levels typically don't need buffering
+ *   - Example: 10 means buffering starts at zoom 10
+ *
+ * Setting: label_buffer_name_multiplier (default: 0 = disabled)
+ *   - Additional buffer pixels per character in the name tag
+ *   - Longer names get larger buffers
+ *   - Example: 3 means a 10-character name gets 30 extra pixels
+ *
+ * Setting: label_buffer_max_width (default: 0 = no maximum)
+ *   - Maximum buffer size in pixels (prevents excessive buffering)
+ *   - Use with label_buffer_name_multiplier to cap the total buffer
+ *   - Example: 200 limits buffer to 200 pixels even for very long names
+ *
+ * Per-Layer Option: buffer (default: true)
+ *   - Can be set per layer to disable buffering for specific layers
+ *   - Example: { "minzoom": 0, "maxzoom": 14, "buffer": false }
+ *
+ * Performance Notes:
+ *   - Buffering increases tile generation time and memory usage
+ *   - Each buffered point can appear in up to 4 tiles
+ *   - Use label_buffer_start_zoom to limit buffering to higher zooms only
+ *
+ * Example Configuration:
+ *   {
+ *     "settings": {
+ *       "label_buffer_pixels": 64,        // 64px buffer
+ *       "label_buffer_start_zoom": 10,     // Start at z10
+ *       "label_buffer_name_multiplier": 3, // 3px per character
+ *       "label_buffer_max_width": 200      // Max 200px total
+ *     },
+ *     "layers": {
+ *       "place": { "minzoom": 0, "maxzoom": 14, "buffer": true },   // Buffered
+ *       "poi":   { "minzoom": 12, "maxzoom": 14, "buffer": false }  // Not buffered
+ *     }
+ *   }
+ */
