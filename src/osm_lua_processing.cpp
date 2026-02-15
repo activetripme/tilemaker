@@ -818,7 +818,7 @@ void OsmLuaProcessing::LayerAsCentroid(const string &layerName, kaguya::Variadic
 	//     We can extend lazy geometries to this, it just needs some fiddling to
 	//     express it in the ID and measure if there's a runtime impact in computing
 	//     the polylabel twice.
-	if (materializeGeometries || (isRelation && relationNode == 0) || (isWay && algorithm != CentroidAlgorithm::Centroid)) {
+	if (materializeGeometries || (isRelation && relationNode == 0) || (isWay)) {
 		id = osmMemTiles.storePoint(geomp);
 	} else if (relationNode != 0) {
 		id = USE_NODE_STORE | relationNode;
