@@ -635,13 +635,32 @@ function way_function()
 	-- Set names on rivers
 	if waterwayClasses[waterway] and not is_closed then
 		if waterway == "river" and Holds("name") then
-			Layer("water_name", false)
+			-- Try offset curved placement first
+			local name = Find("name")
+			local nameLen = name:len()
+			-- Estimate text width in coordinate units (degrees):
+			-- ZRES12 ~= 38.2m per pixel, 7px per char
+			local textWidthM = nameLen * 7 * ZRES12
+			local placed = LayerAsOffsetCurve("waterway_label", {
+				font_size = 12,
+				char_width = 7,
+				text_width_m = textWidthM,
+				offset = 0,
+				mode = "on_line",
+				name = name
+			})
+			if not placed then
+				-- Fallback to standard line-following placement
+				Layer("water_name", false)
+				Attribute("class", waterway)
+				SetNameAttributes()
+			end
 		else
 			Layer("water_name_detail", false)
 			MinZoom(14)
+			Attribute("class", waterway)
+			SetNameAttributes()
 		end
-		Attribute("class", waterway)
-		SetNameAttributes()
 	end
 
 	-- Set 'building' and associated

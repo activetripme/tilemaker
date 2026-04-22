@@ -10,6 +10,7 @@
 #include "tag_map.h"
 #include "node_store.h"
 #include "polylabel.h"
+#include "offset_curve.h"
 #include <signal.h>
 
 using namespace std;
@@ -192,6 +193,7 @@ kaguya::optional<std::vector<double>> rawCentroid(kaguya::VariadicArgType algori
 void rawModifyId(const int newId) { return osmLuaProcessing->ModifyId(newId); }
 void rawLayer(const std::string& layerName, bool area) { return osmLuaProcessing->Layer(layerName, area); }
 void rawLayerAsCentroid(const std::string &layerName, kaguya::VariadicArgType nodeSources) { return osmLuaProcessing->LayerAsCentroid(layerName, nodeSources); }
+bool rawLayerAsOffsetCurve(const std::string &layerName, kaguya::LuaTable options) { return osmLuaProcessing->LayerAsOffsetCurve(layerName, options); }
 void rawMinZoom(const double z) { return osmLuaProcessing->MinZoom(z); }
 void rawZOrder(const double z) { return osmLuaProcessing->ZOrder(z); }
 OsmLuaProcessing::OptionalRelation rawNextRelation() { return osmLuaProcessing->NextRelation(); }
@@ -269,6 +271,7 @@ OsmLuaProcessing::OsmLuaProcessing(
 	luaState["Centroid"] = &rawCentroid;
 	luaState["Layer"] = &rawLayer;
 	luaState["LayerAsCentroid"] = &rawLayerAsCentroid;
+	luaState["LayerAsOffsetCurve"] = &rawLayerAsOffsetCurve;
 	luaState["ModifyId"] = &rawModifyId;
 	luaState["Attribute"] = kaguya::overload(
 			[](const std::string &key, const protozero::data_view val) { osmLuaProcessing->Attribute(key, val, 0); },
@@ -833,6 +836,158 @@ void OsmLuaProcessing::LayerAsCentroid(const string &layerName, kaguya::Variadic
 	}
 	OutputObject oo(POINT_, layers.layerMap[layerName], id, 0, layerMinZoom);
 	outputs.push_back(std::make_pair(std::move(oo), attributes));
+}
+
+// LayerAsOffsetCurve(layerName, options_table)
+//
+// Compute an offset curved guide line for label placement along a linestring.
+// Returns true if a valid placement was found, false otherwise.
+//
+// options_table (Lua table) can contain:
+//   font_size      - font size in pixels (default 12)
+//   char_width     - character width in pixels (default 7)
+//   text_width_m   - text width in meters (if not set, estimated from name length)
+//   offset         - offset distance in pixels (0 = on-line mode)
+//   mode           - "on_line" or "offset" (default "on_line")
+//   max_angle      - max turning angle in degrees (default 45)
+//   flatness_weight - weight for flatness metric (default 1.0)
+//   avdist_weight  - weight for average distance metric (default 1.0)
+//   smoothing      - number of Chaikin iterations (default 3)
+//   simplify       - Douglas-Peucker tolerance (default 0)
+bool OsmLuaProcessing::LayerAsOffsetCurve(const std::string &layerName, kaguya::LuaTable opts) {
+	outputKeys.clear();
+	if (layers.layerMap.count(layerName) == 0) {
+		throw out_of_range("ERROR: LayerAsOffsetCurve(): a layer named as \"" + layerName + "\" doesn't exist.");
+	}
+
+	// Only works for ways and relations with linestring geometry
+	if (!isWay && !isRelation) {
+		ProcessingError("LayerAsOffsetCurve can only be called for ways/relations");
+		return false;
+	}
+
+	uint layerMinZoom = layers.layers[layers.layerMap[layerName]].minzoom;
+
+	// Parse options from Lua table
+	OffsetCurveParams params;
+	std::string labelText;
+
+	// Helper lambdas for safe table access
+	auto getOptDouble = [&](const char* key, double defaultVal) -> double {
+		auto ref = opts[key];
+		if (!ref.isNilref()) return ref.get<double>();
+		return defaultVal;
+	};
+	auto getOptInt = [&](const char* key, int defaultVal) -> int {
+		auto ref = opts[key];
+		if (!ref.isNilref()) return ref.get<int>();
+		return defaultVal;
+	};
+	auto getOptString = [&](const char* key, const std::string& defaultVal) -> std::string {
+		auto ref = opts[key];
+		if (!ref.isNilref()) return ref.get<std::string>();
+		return defaultVal;
+	};
+
+	params.fontSize       = getOptDouble("font_size", params.fontSize);
+	params.charWidth      = getOptDouble("char_width", params.charWidth);
+	params.textWidth      = getOptDouble("text_width_m", 0);
+	params.offsetDistance  = getOptDouble("offset", 0);
+	params.maxAngleDeg    = getOptDouble("max_angle", params.maxAngleDeg);
+	params.flatnessWeight = getOptDouble("flatness_weight", params.flatnessWeight);
+	params.avdistWeight   = getOptDouble("avdist_weight", params.avdistWeight);
+	params.centerBiasWeight = getOptDouble("center_bias", params.centerBiasWeight);
+	params.smoothingIterations = getOptInt("smoothing", params.smoothingIterations);
+	params.simplifyTolerance   = getOptDouble("simplify", params.simplifyTolerance);
+
+	std::string mode = getOptString("mode", "on_line");
+	if (mode == "offset" && params.offsetDistance == 0) {
+		params.offsetDistance = 3.0;  // default: small offset in pixels
+	}
+
+	auto nameRef = opts["name"];
+	if (!nameRef.isNilref()) labelText = nameRef.get<std::string>();
+
+	// textWidth must be set (in meters)
+	if (params.textWidth <= 0) return false;
+
+	// Get the linestring geometry
+	Linestring ls;
+	try {
+		if (isRelation) {
+			const MultiLinestring& mls = multiLinestringCached();
+			if (mls.empty()) return false;
+			ls = mls[0];
+		} else {
+			ls = linestringCached();
+		}
+	} catch (std::out_of_range &err) {
+		ProcessingError("LayerAsOffsetCurve: couldn't get geometry for " + std::to_string(originalOsmID));
+		return false;
+	}
+
+	if (ls.size() < 2) return false;
+
+	// Convert textWidth from meters to coordinate units (degrees).
+	// The linestring coordinates are in degrees (lon, latp).
+	// Use the midpoint latitude for the conversion.
+	double midLatp = ls[ls.size() / 2].y();
+	double textWidthMeters = params.textWidth;
+	params.textWidth = meter2degp(params.textWidth, midLatp);
+
+	// Convert offset distance from pixels to degrees.
+	// 1 pixel at ZRES12 (38.2m), then meters -> degrees.
+	if (params.offsetDistance > 0) {
+		double offsetMeters = params.offsetDistance * 9.55;
+		params.offsetDistance = meter2degp(offsetMeters, midLatp);
+	}
+
+	if (verbose) {
+		std::cout << "LayerAsOffsetCurve " << layerName << " way " << originalOsmID
+		          << " name='" << labelText << "' textWidthM=" << textWidthMeters
+		          << " textWidthDeg=" << params.textWidth
+		          << " pts=" << ls.size() << std::endl;
+	}
+
+	// Compute placement
+	PlacementCandidate placement;
+	if (!computeOffsetCurvePlacement(ls, params, placement)) {
+		if (verbose) {
+			std::cout << "  -> no valid placement found" << std::endl;
+		}
+		return false;
+	}
+
+	if (verbose) {
+		std::cout << "  -> placed, score=" << placement.score
+		          << " guidePts=" << placement.guideLine.size()
+		          << " isOffset=" << placement.isOffset << std::endl;
+	}
+
+	// Validate guide line: reject if any NaN/inf
+	for (const auto& pt : placement.guideLine) {
+		if (!std::isfinite(pt.x()) || !std::isfinite(pt.y())) {
+			if (verbose) std::cout << "  -> rejected: NaN/inf in guide line" << std::endl;
+			return false;
+		}
+	}
+
+	// Store the guide line
+	NodeID id = osmMemTiles.storeLinestring(placement.guideLine);
+	lastStoredGeometryId = id;
+	lastStoredGeometryType = LINESTRING_;
+
+	AttributeSet attributes;
+	OutputObject oo(LINESTRING_, layers.layerMap[layerName], id, 0, layerMinZoom);
+
+	// Set the label name as attribute
+	if (!labelText.empty()) {
+		outputKeys.push_back("name");
+		attributeStore.addAttribute(attributes, "name", protozero::data_view(labelText.data(), labelText.size()), 0);
+	}
+
+	outputs.push_back(std::make_pair(std::move(oo), std::move(attributes)));
+	return true;
 }
 
 Point OsmLuaProcessing::calculateCentroid(CentroidAlgorithm algorithm) {

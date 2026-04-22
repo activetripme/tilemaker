@@ -94,6 +94,7 @@ file(GLOB tilemaker_src_files
 	src/mbtiles.cpp
 	src/mmap_allocator.cpp
 	src/node_stores.cpp
+	src/offset_curve.cpp
 	src/options_parser.cpp
 	src/osm_lua_processing.cpp
 	src/osm_mem_tiles.cpp

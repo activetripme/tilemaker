@@ -195,7 +195,8 @@ public:
 	// Add layer
 	void Layer(const std::string &layerName, bool area);
 	void LayerAsCentroid(const std::string &layerName, kaguya::VariadicArgType nodeSources);
-	
+	bool LayerAsOffsetCurve(const std::string &layerName, kaguya::LuaTable options);
+
 	// Set attributes in a vector tile's Attributes table
 	void ModifyId(const int newId);
 	void Attribute(const std::string &key, const protozero::data_view val, const char minzoom);
