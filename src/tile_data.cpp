@@ -331,17 +331,22 @@ Geometry TileDataSource::buildWayGeometry(OutputGeometryType const geomType,
 			fast_clip(mp, box);
 			geom::correct(mp);
 			geom::validity_failure_type failure = geom::validity_failure_type::no_failure;
-			if (!geom::is_valid(mp,failure)) { 
+			bool valid = geom::is_valid(mp,failure);
+			if (!valid) {
 				if (failure==geom::failure_spikes) {
 					geom::remove_spikes(mp);
-				} else if (failure==geom::failure_self_intersections || failure==geom::failure_intersecting_interiors) {
-					// retry with Boost intersection if fast_clip has caused self-intersections
+					failure = geom::validity_failure_type::no_failure;
+					valid = geom::is_valid(mp,failure);
+				}
+				if (!valid && (failure==geom::failure_self_intersections || failure==geom::failure_intersecting_interiors)) {
 					MultiPolygon output;
 					geom::intersection(input, box, output);
 					geom::correct(output);
+
+					// retry with Boost intersection if fast_clip has caused self-intersections
 					multiPolygonClipCache.add(bbox, objectID, output);
 					return output;
-				} else {
+				} else if (!valid) {
 					// occasionally also wrong_topological_dimension, disconnected_interior
 				}
 			}
@@ -395,6 +400,11 @@ void populateTilesAtZoom(
 	}
 }
 
+void sortOutputObjectIDs(
+	const std::vector<bool>& sortOrders, 
+	std::vector<OutputObjectID>& data
+);
+
 std::vector<OutputObjectID> TileDataSource::getObjectsForTile(
 	const std::vector<bool>& sortOrders, 
 	unsigned int zoom,
@@ -403,23 +413,7 @@ std::vector<OutputObjectID> TileDataSource::getObjectsForTile(
 	std::vector<OutputObjectID> data;
 	collectObjectsForTile(zoom, coordinates, data);
 	collectLargeObjectsForTile(zoom, coordinates, data);
-
-	// Lexicographic comparison, with the order of: layer, geomType, attributes, and objectID.
-	// Note that attributes is preferred to objectID.
-	// It is to arrange objects with the identical attributes continuously.
-	// Such objects will be merged into one object, to reduce the size of output.
-	boost::sort::pdqsort(data.begin(), data.end(), [&sortOrders](const OutputObjectID& x, const OutputObjectID& y) -> bool {
-		if (x.oo.layer < y.oo.layer) return true;
-		if (x.oo.layer > y.oo.layer) return false;
-		if (x.oo.z_order < y.oo.z_order) return  sortOrders[x.oo.layer];
-		if (x.oo.z_order > y.oo.z_order) return !sortOrders[x.oo.layer];
-		if (x.oo.geomType < y.oo.geomType) return true;
-		if (x.oo.geomType > y.oo.geomType) return false;
-		if (x.oo.attributes < y.oo.attributes) return true;
-		if (x.oo.attributes > y.oo.attributes) return false;
-		if (x.oo.objectID < y.oo.objectID) return true;
-		return false;
-	});
+	sortOutputObjectIDs(sortOrders, data);
 	data.erase(unique(data.begin(), data.end()), data.end());
 	return data;
 }

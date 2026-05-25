@@ -28,7 +28,7 @@ COPY server ./server
 RUN mkdir build && \
     cd build && \
     if [ -z "$BUILD_DEBUG" ]; then \
-        cmake -DCMAKE_BUILD_TYPE=Release ..; \
+        cmake -DCMAKE_BUILD_TYPE=Release -DBoost_USE_DEBUG_RUNTIME=OFF ..; \
     else \
         cmake -DCMAKE_BUILD_TYPE=Debug ..; \
     fi; \
@@ -60,6 +60,7 @@ WORKDIR /usr/src/app
 COPY --from=src /usr/src/app/build/tilemaker .
 COPY --from=src /usr/src/app/build/tilemaker-server .
 COPY --from=src /usr/local/lib/lua/5.1/flock.so /usr/local/lib/lua/5.1/flock.so
+COPY server/static ./static
 COPY resources ./resources
 COPY process.lua ./
 COPY config.json ./

@@ -35,7 +35,26 @@ IF ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
     LINK_DIRECTORIES(${Boost_LIBRARY_DIRS})
 ENDIF ()
 
-find_package(Boost 1.66 REQUIRED COMPONENTS system filesystem program_options)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+	set(Boost_USE_DEBUG_RUNTIME true)
+else()
+	set(Boost_USE_DEBUG_RUNTIME false)
+endif()
+
+set(BOOST_HAS_SYSTEM false)
+set(BOOST_HAS_THROW_EXCEPTION false)
+
+find_package(Boost 1.89 QUIET COMPONENTS filesystem program_options)
+
+if(Boost_FOUND)
+	find_package(Boost 1.89 QUIET COMPONENTS throw_exception)
+	if(TARGET Boost::throw_exception)
+		set(BOOST_HAS_THROW_EXCEPTION true)
+	endif()
+else()
+	find_package(Boost 1.66 REQUIRED COMPONENTS system filesystem program_options)
+	set(BOOST_HAS_SYSTEM true)
+endif()
 
 find_package(libshp REQUIRED)
 
@@ -56,7 +75,8 @@ set(CMAKE_CXX_STANDARD 17)
 if(!TM_VERSION)
 	execute_process(
 		COMMAND git describe --tags --abbrev=0
-		OUTPUT_VARIABLE tm_version)
+		OUTPUT_VARIABLE tm_version
+		OUTPUT_STRIP_TRAILING_WHITESPACE)
 	add_compile_definitions(TM_VERSION=${tm_version})
 endif()
 
@@ -64,10 +84,16 @@ if(MSVC)
  	find_package(unofficial-sqlite3 CONFIG REQUIRED)
 	add_library(SQLite::SQLite3 ALIAS unofficial::sqlite3::sqlite3)
 	add_definitions(-D_USE_MATH_DEFINES -DWIN32_LEAN_AND_MEAN -DNOGDI -D__restrict__=__restrict)
-  	set(THREAD_LIB "")
+	set(THREAD_LIB "")
 else()
 	find_package(SQLite3 REQUIRED)
-  	set(THREAD_LIB pthread)
+	if(NOT TARGET SQLite::SQLite3)
+	  add_library(SQLite::SQLite3 IMPORTED UNKNOWN)
+	  set_target_properties(SQLite::SQLite3 PROPERTIES
+	    IMPORTED_LOCATION "${SQLite3_LIBRARIES}"
+	    INTERFACE_INCLUDE_DIRECTORIES "${SQLite3_INCLUDE_DIRS}")
+	endif()
+	set(THREAD_LIB pthread)
 endif()
 
 file(GLOB tilemaker_src_files
@@ -116,6 +142,7 @@ file(GLOB tilemaker_src_files
 	src/tag_map.cpp
 	src/tile_coordinates_set.cpp
 	src/tile_data.cpp
+	src/tile_sorting.cpp
 	src/tilemaker.cpp
 	src/tile_worker.cpp
 	src/visvalingam.cpp
@@ -130,7 +157,13 @@ target_link_libraries(tilemaker
 		shapelib::shp
 		SQLite::SQLite3
 		Rapidjson::rapidjson
-		Boost::system Boost::filesystem Boost::program_options)
+		Boost::filesystem Boost::program_options)
+if(BOOST_HAS_SYSTEM)
+	target_link_libraries(tilemaker Boost::system)
+endif()
+if(BOOST_HAS_THROW_EXCEPTION)
+	target_link_libraries(tilemaker Boost::throw_exception)
+endif()
 
 include(CheckCxxAtomic)
 if(NOT HAVE_CXX11_ATOMIC)
@@ -143,5 +176,8 @@ install(FILES docs/man/tilemaker.1 DESTINATION share/man/man1)
 add_executable(tilemaker-server server/server.cpp)
 target_include_directories(tilemaker-server PRIVATE include)
 target_link_libraries(tilemaker-server ${THREAD_LIB} ${CMAKE_DL_LIBS} SQLite::SQLite3 Boost::filesystem Boost::program_options)
+if(BOOST_HAS_THROW_EXCEPTION)
+	target_link_libraries(tilemaker-server Boost::throw_exception)
+endif()
 
 install(TARGETS tilemaker tilemaker-server RUNTIME DESTINATION bin)
