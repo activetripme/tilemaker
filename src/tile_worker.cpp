@@ -221,13 +221,29 @@ void writeMultiPolygon(
 	const MultiPolygon& mp
 ) {
 	MultiPolygon current = bbox.scaleGeometry(mp);
+	MultiPolygon scaled = current; // keep pre-simplify version as fallback
 	if (simplifyLevel>0) {
+		double tol = simplifyLevel/bbox.xscale;
 		if (simplifyAlgo == LayerDef::VISVALINGAM) {
-			current = simplifyVis(current, simplifyLevel/bbox.xscale);
+			current = simplifyVis(current, tol);
 		} else {
-			current = simplify(current, simplifyLevel/bbox.xscale);
+			current = simplify(current, tol);
 		}
 		geom::remove_spikes(current);
+		// If simplification killed the polygon, retry with progressively smaller tolerance
+		if (geom::is_empty(current) && !geom::is_empty(scaled)) {
+			for (double factor = 0.8; factor >= 0.05; factor -= 0.1) {
+				if (simplifyAlgo == LayerDef::VISVALINGAM) {
+					current = simplifyVis(scaled, tol * factor);
+				} else {
+					current = simplify(scaled, tol * factor);
+				}
+				geom::remove_spikes(current);
+				if (!geom::is_empty(current)) break;
+			}
+			if (geom::is_empty(current))
+				current = scaled; // use unsimplified as last resort
+		}
 	}
 	if (geom::is_empty(current))
 		return;
