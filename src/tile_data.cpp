@@ -389,10 +389,26 @@ Geometry TileDataSource::buildWayGeometry(OutputGeometryType const geomType,
 				}
 				if (!valid) {
 					// Try to fix self-intersections using dissolve/make_valid
+					Box pre_valid_env; if (!geom::is_empty(mp)) geom::envelope(mp, pre_valid_env);
 					make_valid(mp);
 					geom::correct(mp);
-					if (!geom::is_empty(mp))
+					if (!geom::is_empty(mp)) {
 						valid = geom::is_valid(mp, failure);
+						// make_valid can dissolve a polygon into smaller pieces that
+						// lose coverage. Check if the result still covers the clip box.
+						// If not, skip make_valid result and use per-polygon intersection.
+						if (valid) {
+							Box post_valid_env; geom::envelope(mp, post_valid_env);
+							double pre_h = pre_valid_env.max_corner().y() - pre_valid_env.min_corner().y();
+							double post_h = post_valid_env.max_corner().y() - post_valid_env.min_corner().y();
+							double pre_w = pre_valid_env.max_corner().x() - pre_valid_env.min_corner().x();
+							double post_w = post_valid_env.max_corner().x() - post_valid_env.min_corner().x();
+							// If make_valid shrank the result to less than 80% of original extent
+							// in either dimension, the fix is worse than the disease.
+							if (pre_h > 0 && post_h < pre_h * 0.8) valid = false;
+							if (pre_w > 0 && post_w < pre_w * 0.8) valid = false;
+						}
+					}
 					}
 				if (!valid) {
 					// Try per-polygon intersection as the full intersection may fail
