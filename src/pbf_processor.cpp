@@ -288,7 +288,7 @@ bool PbfProcessor::ReadRelations(
 
 			bool isMultiPolygon = relationIsType(pbfRelation, typeKey, mpKey);
 			bool isBoundary = relationIsType(pbfRelation, typeKey, boundaryKey);
-			if (!isMultiPolygon && !isBoundary && !output.canWriteRelations()) continue;
+			if (!isMultiPolygon && !isBoundary) continue;
 
 			// Read relation members
 			WayVec outerWayVec, innerWayVec;
