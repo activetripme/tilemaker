@@ -2,6 +2,7 @@
 #include <iostream>
 #include "tile_data.h"
 #include "coordinates_geom.h"
+#include "helpers.h"
 #include "leased_store.h"
 #include <ciso646>
 
@@ -202,14 +203,17 @@ void TileDataSource::collectLargeObjectsForTile(
 	TileCoordinates srcIndex2((dstIndex.x+1)*scale-1, (dstIndex.y+1)*scale-1);
 	Box box = Box(geom::make<Point>(srcIndex1.x, srcIndex1.y),
 	              geom::make<Point>(srcIndex2.x, srcIndex2.y));
+
 	for(auto const& result: boxRtree | boost::geometry::index::adaptors::queried(boost::geometry::index::intersects(box))) {
-		if (result.second.minZoom <= zoom)
+		if (result.second.minZoom <= zoom) {
 			output.push_back({result.second, 0});
+		}
 	}
 
 	for(auto const& result: boxRtreeWithIds | boost::geometry::index::adaptors::queried(boost::geometry::index::intersects(box))) {
-		if (result.second.oo.minZoom <= zoom)
+		if (result.second.oo.minZoom <= zoom) {
 			output.push_back({result.second.oo, result.second.id});
+		}
 	}
 }
 
@@ -273,7 +277,6 @@ Geometry TileDataSource::buildWayGeometry(OutputGeometryType const geomType,
 			std::shared_ptr<MultiPolygon> cachedClip = multiPolygonClipCache.get(bbox.zoom, bbox.index.x, bbox.index.y, objectID);
 
 			MultiPolygon uncached;
-
 			if (cachedClip == nullptr) {
 				// The cached multipolygon uses a non-standard allocator, so copy it
 				populateMultiPolygon(uncached, objectID);
@@ -282,7 +285,7 @@ Geometry TileDataSource::buildWayGeometry(OutputGeometryType const geomType,
 			const auto &input = cachedClip == nullptr ? uncached : *cachedClip;
 
 			Box box = bbox.clippingBox;
-			
+
 			if (bbox.endZoom) {
 				for(auto const &p: input) {
 					for(auto const &inner: p.inners()) {
@@ -330,6 +333,52 @@ Geometry TileDataSource::buildWayGeometry(OutputGeometryType const geomType,
 			geom::assign(mp, input);
 			fast_clip(mp, box);
 			geom::correct(mp);
+			// If fast_clip emptied the polygon but input was non-empty,
+			// fall back to Boost intersection
+			if (geom::is_empty(mp) && !geom::is_empty(input)) {
+				MultiPolygon fallback;
+				geom::intersection(input, box, fallback);
+				geom::correct(fallback);
+				if (!geom::is_empty(fallback))
+					mp = std::move(fallback);
+			}
+			// If still empty and input was from cache, retry with original polygon.
+			// The cached clip result may have been clipped at a different zoom level
+			// where the margin was different, causing edge polygons to be lost.
+			// If still empty, the polygon may be barely touching the tile boundary.
+			// With BOOST_GEOMETRY_NO_ROBUSTNESS, intersection can fail for edge cases.
+			// Try with a slightly expanded clip box to capture edge geometry.
+			if (geom::is_empty(mp) && !geom::is_empty(input)) {
+				double eps = (box.max_corner().x() - box.min_corner().x()) * 1e-6;
+				Box expandedBox(
+					Point(box.min_corner().x() - eps, box.min_corner().y() - eps),
+					Point(box.max_corner().x() + eps, box.max_corner().y() + eps));
+				MultiPolygon expanded;
+				geom::intersection(input, expandedBox, expanded);
+				geom::correct(expanded);
+				if (!geom::is_empty(expanded)) {
+					// Clip the expanded result back to the original box
+					fast_clip(expanded, box);
+					geom::correct(expanded);
+					if (!geom::is_empty(expanded))
+						mp = std::move(expanded);
+				}
+				if (geom::is_empty(mp)) {
+					// Last resort: try with original (uncached) polygon
+					MultiPolygon original;
+					populateMultiPolygon(original, objectID);
+					if (!geom::is_empty(original)) {
+						geom::intersection(original, expandedBox, expanded);
+						geom::correct(expanded);
+						if (!geom::is_empty(expanded)) {
+							fast_clip(expanded, box);
+							geom::correct(expanded);
+							if (!geom::is_empty(expanded))
+								mp = std::move(expanded);
+						}
+					}
+				}
+			}
 			geom::validity_failure_type failure = geom::validity_failure_type::no_failure;
 			bool valid = geom::is_valid(mp,failure);
 			if (!valid) {
@@ -338,20 +387,33 @@ Geometry TileDataSource::buildWayGeometry(OutputGeometryType const geomType,
 					failure = geom::validity_failure_type::no_failure;
 					valid = geom::is_valid(mp,failure);
 				}
-				if (!valid && (failure==geom::failure_self_intersections || failure==geom::failure_intersecting_interiors)) {
+				if (!valid) {
+					// Try to fix self-intersections using dissolve/make_valid
+					make_valid(mp);
+					geom::correct(mp);
+					if (!geom::is_empty(mp))
+						valid = geom::is_valid(mp, failure);
+					}
+				if (!valid) {
+					// Try per-polygon intersection as the full intersection may fail
+					// for complex/invalid polygons
 					MultiPolygon output;
-					geom::intersection(input, box, output);
+					for (auto const &p : input) {
+						try {
+							MultiPolygon part;
+							geom::intersection(p, box, part);
+							for (auto &pp : part) output.push_back(std::move(pp));
+						} catch (...) {}
+					}
 					geom::correct(output);
-
-					// retry with Boost intersection if fast_clip has caused self-intersections
-					multiPolygonClipCache.add(bbox, objectID, output);
+					if (!geom::is_empty(output))
+						multiPolygonClipCache.add(bbox, objectID, output);
 					return output;
-				} else if (!valid) {
-					// occasionally also wrong_topological_dimension, disconnected_interior
 				}
 			}
 
-			multiPolygonClipCache.add(bbox, objectID, mp);
+			if (!geom::is_empty(mp))
+				multiPolygonClipCache.add(bbox, objectID, mp);
 			return mp;
 		}
 
@@ -406,7 +468,7 @@ void sortOutputObjectIDs(
 );
 
 std::vector<OutputObjectID> TileDataSource::getObjectsForTile(
-	const std::vector<bool>& sortOrders, 
+	const std::vector<bool>& sortOrders,
 	unsigned int zoom,
 	TileCoordinates coordinates
 ) {
@@ -415,6 +477,7 @@ std::vector<OutputObjectID> TileDataSource::getObjectsForTile(
 	collectLargeObjectsForTile(zoom, coordinates, data);
 	sortOutputObjectIDs(sortOrders, data);
 	data.erase(unique(data.begin(), data.end()), data.end());
+
 	return data;
 }
 

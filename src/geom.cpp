@@ -1,4 +1,4 @@
-#define BOOST_GEOMETRY_NO_ROBUSTNESS
+// #define BOOST_GEOMETRY_NO_ROBUSTNESS  -- disabled for robust geometry
 #include "geom.h"
 
 #include <boost/geometry/geometries/segment.hpp>
