@@ -330,102 +330,33 @@ Geometry TileDataSource::buildWayGeometry(OutputGeometryType const geomType,
 			}
 
 			MultiPolygon mp;
-			geom::assign(mp, input);
-			fast_clip(mp, box);
-			geom::correct(mp);
-			// If fast_clip emptied the polygon but input was non-empty,
-			// fall back to Boost intersection
-			if (geom::is_empty(mp) && !geom::is_empty(input)) {
-				MultiPolygon fallback;
-				geom::intersection(input, box, fallback);
-				geom::correct(fallback);
-				if (!geom::is_empty(fallback))
-					mp = std::move(fallback);
-			}
-			// If still empty and input was from cache, retry with original polygon.
-			// The cached clip result may have been clipped at a different zoom level
-			// where the margin was different, causing edge polygons to be lost.
-			// If still empty, the polygon may be barely touching the tile boundary.
-			// With BOOST_GEOMETRY_NO_ROBUSTNESS, intersection can fail for edge cases.
-			// Try with a slightly expanded clip box to capture edge geometry.
-			if (geom::is_empty(mp) && !geom::is_empty(input)) {
-				double eps = (box.max_corner().x() - box.min_corner().x()) * 1e-6;
-				Box expandedBox(
-					Point(box.min_corner().x() - eps, box.min_corner().y() - eps),
-					Point(box.max_corner().x() + eps, box.max_corner().y() + eps));
-				MultiPolygon expanded;
-				geom::intersection(input, expandedBox, expanded);
-				geom::correct(expanded);
-				if (!geom::is_empty(expanded)) {
-					// Clip the expanded result back to the original box
-					fast_clip(expanded, box);
-					geom::correct(expanded);
-					if (!geom::is_empty(expanded))
-						mp = std::move(expanded);
+			// Count total vertices to decide clipping strategy
+			size_t total_vertices = 0;
+			for (auto const &p : input) total_vertices += p.outer().size();
+
+			if (total_vertices < 1000) {
+				// Simple polygon: fast_clip is fast and usually produces valid results
+				geom::assign(mp, input);
+				fast_clip(mp, box);
+				geom::correct(mp);
+				if (geom::is_empty(mp) && !geom::is_empty(input)) {
+					MultiPolygon fallback;
+					geom::intersection(input, box, fallback);
+					geom::correct(fallback);
+					if (!geom::is_empty(fallback))
+						mp = std::move(fallback);
 				}
-				if (geom::is_empty(mp)) {
-					// Last resort: try with original (uncached) polygon
-					MultiPolygon original;
-					populateMultiPolygon(original, objectID);
-					if (!geom::is_empty(original)) {
-						geom::intersection(original, expandedBox, expanded);
-						geom::correct(expanded);
-						if (!geom::is_empty(expanded)) {
-							fast_clip(expanded, box);
-							geom::correct(expanded);
-							if (!geom::is_empty(expanded))
-								mp = std::move(expanded);
-						}
-					}
+			} else {
+				// Complex polygon: per-polygon Boost intersection to avoid
+				// self-intersections from fast_clip on concave geometry
+				for (auto const &p : input) {
+					try {
+						MultiPolygon part;
+						geom::intersection(p, box, part);
+						for (auto &pp : part) mp.push_back(std::move(pp));
+					} catch (...) {}
 				}
-			}
-			geom::validity_failure_type failure = geom::validity_failure_type::no_failure;
-			bool valid = geom::is_valid(mp,failure);
-			if (!valid) {
-				if (failure==geom::failure_spikes) {
-					geom::remove_spikes(mp);
-					failure = geom::validity_failure_type::no_failure;
-					valid = geom::is_valid(mp,failure);
-				}
-				if (!valid) {
-					// Try to fix self-intersections using dissolve/make_valid
-					Box pre_valid_env; if (!geom::is_empty(mp)) geom::envelope(mp, pre_valid_env);
-					make_valid(mp);
-					geom::correct(mp);
-					if (!geom::is_empty(mp)) {
-						valid = geom::is_valid(mp, failure);
-						// make_valid can dissolve a polygon into smaller pieces that
-						// lose coverage. Check if the result still covers the clip box.
-						// If not, skip make_valid result and use per-polygon intersection.
-						if (valid) {
-							Box post_valid_env; geom::envelope(mp, post_valid_env);
-							double pre_h = pre_valid_env.max_corner().y() - pre_valid_env.min_corner().y();
-							double post_h = post_valid_env.max_corner().y() - post_valid_env.min_corner().y();
-							double pre_w = pre_valid_env.max_corner().x() - pre_valid_env.min_corner().x();
-							double post_w = post_valid_env.max_corner().x() - post_valid_env.min_corner().x();
-							// If make_valid shrank the result to less than 80% of original extent
-							// in either dimension, the fix is worse than the disease.
-							if (pre_h > 0 && post_h < pre_h * 0.8) valid = false;
-							if (pre_w > 0 && post_w < pre_w * 0.8) valid = false;
-						}
-					}
-					}
-				if (!valid) {
-					// Try per-polygon intersection as the full intersection may fail
-					// for complex/invalid polygons
-					MultiPolygon output;
-					for (auto const &p : input) {
-						try {
-							MultiPolygon part;
-							geom::intersection(p, box, part);
-							for (auto &pp : part) output.push_back(std::move(pp));
-						} catch (...) {}
-					}
-					geom::correct(output);
-					if (!geom::is_empty(output))
-						multiPolygonClipCache.add(bbox, objectID, output);
-					return output;
-				}
+				geom::correct(mp);
 			}
 
 			if (!geom::is_empty(mp))
