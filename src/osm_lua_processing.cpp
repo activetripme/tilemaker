@@ -1318,8 +1318,8 @@ double OsmLuaProcessing::calculateBufferSize(const OutputObject& oo) {
 		return bufferSize;
 	}
 
-	// Get attributes for this object
-	std::vector<const AttributePair*> attributes = attributeStore.getUnsafe(oo.attributes);
+	// Get attributes for this object (потокобезопасно: calculateBufferSize зовётся ВО ВРЕМЯ чтения PBF)
+	std::vector<const AttributePair*> attributes = attributeStore.getSafe(oo.attributes);
 
 	// Find the 'name' attribute
 	for (const auto* attr : attributes) {

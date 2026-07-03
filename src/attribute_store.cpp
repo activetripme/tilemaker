@@ -372,6 +372,29 @@ std::vector<const AttributePair*> AttributeStore::getUnsafe(AttributeIndex index
 	}
 }
 
+std::vector<const AttributePair*> AttributeStore::getSafe(AttributeIndex index) const {
+	// Потокобезопасный аналог getUnsafe: под блокировкой setsMutex[shard]. Безопасен ВО ВРЕМЯ
+	// чтения PBF (getUnsafe — только после). При невалидном индексе (add/resize гонит параллельно)
+	// возвращаем пустой вектор вместо throw — caller (calculateBufferSize) просто не найдёт name
+	// и использует base buffer. Это убирает краш "Failed to fetch attributes at index …".
+	uint32_t shard = index >> (32 - SHARD_BITS);
+	uint32_t offset = index & (~(~0u << (32 - SHARD_BITS)));
+
+	std::lock_guard<std::mutex> lock(setsMutex[shard]);
+	if (offset >= sets[shard].size())
+		return {};
+
+	const AttributeSet& attrSet = sets[shard][offset];
+	const size_t n = attrSet.numPairs();
+
+	std::vector<const AttributePair*> rv;
+	rv.reserve(n);
+	for (size_t i = 0; i < n; i++) {
+		rv.push_back(&pairStore.getPairUnsafe(attrSet.getPair(i)));
+	}
+	return rv;
+}
+
 size_t AttributeStore::size() const {
 	size_t numAttributeSets = 0;
 	for (int i = 0; i < ATTRIBUTE_SHARDS; i++)

@@ -402,6 +402,10 @@ private:
 struct AttributeStore {
 	AttributeIndex add(AttributeSet &attributes);
 	std::vector<const AttributePair*> getUnsafe(AttributeIndex index) const;
+	// Потокобезопасный getter под блокировкой setsMutex[shard] — для вызовов ВО ВРЕМЯ чтения PBF
+	// (getUnsafe безопасен только после полного чтения). При невалидном индексе (race add/resize)
+	// возвращает пустой вектор вместо throw — caller (calculateBufferSize) падает до base buffer.
+	std::vector<const AttributePair*> getSafe(AttributeIndex index) const;
 	void reset(); // used for testing
 	size_t size() const;
 	void reportSize() const;
