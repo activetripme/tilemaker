@@ -207,22 +207,37 @@ bool PbfProcessor::ScanRelations(OsmLuaProcessing& output, PbfReader::PrimitiveG
 
 	int typeKey = findStringPosition(pb, "type");
 	int mpKey   = findStringPosition(pb, "multipolygon");
+	int boundaryKey = findStringPosition(pb, "boundary");
 
 	for (PbfReader::Relation pbfRelation : pg.relations()) {
 		bool isMultiPolygon = relationIsType(pbfRelation, typeKey, mpKey);
+		// type=boundary relations are rendered as areas (multipolygons) in ReadRelations,
+		// so their member ways must be retained too — otherwise untagged boundary
+		// segments (e.g. a 489-node park-border way with no tags) get filtered out,
+		// punching a hole in the assembled polygon.
+		bool isBoundary = relationIsType(pbfRelation, typeKey, boundaryKey);
 		bool isAccepted = false;
 		WayID relid = static_cast<WayID>(pbfRelation.id);
 		tags.reset();
 		readTags(pbfRelation, pb, tags);
 
-		if (!isMultiPolygon) {
+		if (!isMultiPolygon && !isBoundary) {
 			if (output.canReadRelations()) {
 				isAccepted = output.scanRelation(relid, tags);
 			}
 
 			if (!isAccepted) continue;
 		} else {
-			if (!wayKeys.filter(tags))
+			// Multipolygon or boundary relation: ReadRelations renders these as
+			// areas, so their member ways must be retained too — otherwise
+			// untagged boundary segments (e.g. a 489-node park-border way with
+			// no tags) get filtered out in the Ways phase and punch a hole in
+			// the assembled polygon. For boundary relations, still let the lua
+			// scan it (preserves relation_scan_function behaviour).
+			if (isBoundary && output.canReadRelations()) {
+				isAccepted = output.scanRelation(relid, tags);
+			}
+			if (!isAccepted && !wayKeys.filter(tags))
 				continue;
 		}
 		osmStore.usedRelations.set(relid);
