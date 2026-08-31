@@ -1,4 +1,5 @@
 #include <iostream>
+#include <cstdlib>
 #include "pbf_processor.h"
 #include "pbf_reader.h"
 
@@ -209,6 +210,15 @@ bool PbfProcessor::ScanRelations(OsmLuaProcessing& output, PbfReader::PrimitiveG
 	int mpKey   = findStringPosition(pb, "multipolygon");
 	int boundaryKey = findStringPosition(pb, "boundary");
 
+	// Порог числа members для удержания не-принятых lua boundary-связей (см. ниже).
+	static const size_t maxRelationMembers = [] {
+		const char* env = std::getenv("TILEMAKER_MAX_RELATION_MEMBERS");
+		if (env == nullptr || *env == '\0') return (size_t)10000;
+		char* end = nullptr;
+		unsigned long long v = std::strtoull(env, &end, 10);
+		return (end != nullptr && *end == '\0') ? (size_t)v : (size_t)10000;
+	}();
+
 	for (PbfReader::Relation pbfRelation : pg.relations()) {
 		bool isMultiPolygon = relationIsType(pbfRelation, typeKey, mpKey);
 		// type=boundary relations are rendered as areas (multipolygons) in ReadRelations,
@@ -238,6 +248,18 @@ bool PbfProcessor::ScanRelations(OsmLuaProcessing& output, PbfReader::PrimitiveG
 				isAccepted = output.scanRelation(relid, tags);
 			}
 			if (!isAccepted && !wayKeys.filter(tags))
+				continue;
+			// Не-принятые lua boundary-связи (protected_area, political, maritime —
+			// весь WDPA) 1052d97 начал удерживать целиком. До него они дёшево
+			// пропускались (skipToNext на отсутствующем member way), после — все
+			// собирались в ReadRelations: планетарная сборка этих гигантов убивала
+			// процесс по памяти (OOM на Block 1819/1834, relations-фаза, дважды,
+			// в т.ч. при 1TB RAM + 700GB swap). Компромисс: компактные связи
+			// (реальные парки/заказники; региональный максимум — Теберда
+			// r20955214, 205 members) удерживаем целиком, монстров пропускаем
+			// как до 1052d97. Порог крутится env'ом для A/B на planet без
+			// пересборки; 0 = без лимита (поведение 1052d97).
+			if (isBoundary && !isAccepted && pbfRelation.memids.size() > maxRelationMembers)
 				continue;
 		}
 		osmStore.usedRelations.set(relid);
