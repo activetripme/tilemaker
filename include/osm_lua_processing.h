@@ -11,6 +11,7 @@
 #include "osm_store.h"
 #include "shared_data.h"
 #include "output_object.h"
+#include "declutter.h"
 #include "shp_mem_tiles.h"
 #include "osm_mem_tiles.h"
 #include "helpers.h"
@@ -57,6 +58,7 @@ public:
 		const class ShpMemTiles &shpMemTiles, 
 		class OsmMemTiles &osmMemTiles,
 		AttributeStore &attributeStore,
+		class Declutter &declutter,
 		bool materializeGeometries,
 		bool isFirst
 	);
@@ -205,6 +207,7 @@ public:
 	void AttributeInteger(const std::string &key, const int val, const char minzoom);
 	void MinZoom(const double z);
 	void ZOrder(const double z);
+	void Score(const double score);
 	
 	// Relation scan support
 
@@ -266,6 +269,7 @@ private:
 		relationAccepted = false;
 		relationList.clear();
 		relationSubscript = -1;
+		declutterOutputs.clear();
 		lastStoredGeometryId = 0;
 		isWay = false;
 		isRelation = false;
@@ -274,9 +278,13 @@ private:
 
 	void removeAttributeIfNeeded(const std::string& key);
 
+	void noteIfDecluttered(LatpLon point);
+
 	const inline Point getPoint() {
 		return Point(lon/10000000.0,latp/10000000.0);
 	}
+
+	double projectedPolygonArea(const Polygon &p);
 	
 	OSMStore &osmStore;	// global OSM store
 
@@ -290,6 +298,7 @@ private:
 	const class ShpMemTiles &shpMemTiles;
 	class OsmMemTiles &osmMemTiles;
 	AttributeStore &attributeStore;			// key/value store
+	class Declutter &declutter;				// point features held back for decluttering
 
 	int64_t originalOsmID;					///< Original OSM object ID
 	bool isWay, isRelation, isClosed;		///< Way, node, relation?
@@ -311,6 +320,7 @@ private:
 	bool multiLinestringInited;
 	MultiPolygon multiPolygonCache;
 	bool multiPolygonInited;
+	geom::model::polygon<DegPoint> areaPolygonCache;
 
 	NodeID lastStoredGeometryId;
 	OutputGeometryType lastStoredGeometryType;
@@ -319,6 +329,11 @@ private:
 	class LayerDefinition &layers;
 
 	std::vector<std::pair<OutputObject, AttributeSet>> outputs;		// All output objects that have been created
+
+	// Point features in decluttered layers: the exact location we'd have indexed them at,
+	// plus the score from Score(). Sparse - most objects add nothing here.
+	struct PendingDeclutter { uint32_t outputIndex; LatpLon point; int32_t score; };
+	std::vector<PendingDeclutter> declutterOutputs;
 	std::vector<std::string> outputKeys;
 	const PbfReader::Relation* currentRelation;
 	const boost::container::flat_map<std::string, std::string>* currentPostScanTags; // for postScan only

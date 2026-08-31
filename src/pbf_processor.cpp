@@ -316,7 +316,7 @@ bool PbfProcessor::ReadRelations(
 	int boundaryKey = findStringPosition(pb, "boundary");
 	int innerKey= findStringPosition(pb, "inner");
 	int outerKey= findStringPosition(pb, "outer");
-	if (typeKey >-1 && mpKey>-1) {
+	if (typeKey >-1) {
 		int j = -1;
 		for (PbfReader::Relation pbfRelation : pg.relations()) {
 			j++;
@@ -711,6 +711,7 @@ int PbfProcessor::ReadPbfFile(
 
 			blocksToProcess = filteredBlocks.size();
 			blocksProcessed = 0;
+			phaseProgress = 0;
 
 			// Relations have very non-uniform processing times, so prefer
 			// to process them as granularly as possible.

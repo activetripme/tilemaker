@@ -28,6 +28,7 @@
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/filereadstream.h"
 #include "rapidjson/filewritestream.h"
+#include "rapidjson/error/en.h"
 
 #ifndef _MSC_VER
 #include <sys/resource.h>
@@ -38,6 +39,7 @@
 #include "way_stores.h"
 
 // Tilemaker code
+#include "config_validator.h"
 #include "helpers.h"
 #include "coordinates.h"
 #include "coordinates_geom.h"
@@ -169,12 +171,21 @@ int main(const int argc, const char* argv[]) {
 	rapidjson::Document jsonConfig;
 	class Config config;
 	try {
-		FILE* fp = fopen(options.jsonFile.c_str(), "r");
+		FilePtr fp = openFile(options.jsonFile, "r");
 		char readBuffer[65536];
-		rapidjson::FileReadStream is(fp, readBuffer, sizeof(readBuffer));
+		rapidjson::FileReadStream is(fp.get(), readBuffer, sizeof(readBuffer));
 		jsonConfig.ParseStream(is);
-		if (jsonConfig.HasParseError()) { cerr << "Invalid JSON file." << endl; return -1; }
-		fclose(fp);
+		if (jsonConfig.HasParseError()) {
+			cerr << "Invalid JSON file: " << rapidjson::GetParseError_En(jsonConfig.GetParseError())
+			     << " at offset " << jsonConfig.GetErrorOffset() << "." << endl;
+			return -1;
+		}
+
+		string jsonError;
+		if (!validateConfigJson(jsonConfig, jsonError)) {
+			cerr << "Invalid JSON file: " << jsonError << "." << endl;
+			return -1;
+		}
 
 		config.readConfig(jsonConfig, hasClippingBox, clippingBox);
 	} catch (...) {
@@ -250,14 +261,17 @@ int main(const int argc, const char* argv[]) {
 
 	class LayerDefinition layers(config.layers);
 
+	class Declutter declutter;
+	declutter.configure(layers.layers);
+
 	const unsigned int indexZoom = std::min(config.baseZoom, 14u);
 	class OsmMemTiles osmMemTiles(options.threadNum, indexZoom, config.includeID, *nodeStore, *wayStore);
-	class ShpMemTiles shpMemTiles(options.threadNum, indexZoom);
+	class ShpMemTiles shpMemTiles(options.threadNum, indexZoom, declutter);
 	osmMemTiles.open();
 	shpMemTiles.open();
 
 	OsmLuaProcessing osmLuaProcessing(osmStore, config, layers, options.luaFile, 
-		shpMemTiles, osmMemTiles, attributeStore, options.osm.materializeGeometries, true);
+		shpMemTiles, osmMemTiles, attributeStore, declutter, options.osm.materializeGeometries, true);
 
 	// ---- Load external sources (shp/geojson)
 
@@ -272,12 +286,22 @@ int main(const int argc, const char* argv[]) {
 				if (!hasClippingBox) {
 					cerr << "Can't read shapefiles unless a bounding box is provided." << endl;
 					exit(EXIT_FAILURE);
-				} else if (ends_with(layer.source, "json") || ends_with(layer.source, "jsonl") || ends_with(layer.source, "JSON") || ends_with(layer.source, "JSONL") || ends_with(layer.source, "jsonseq") || ends_with(layer.source, "JSONSEQ")) {
-					cout << "Reading GeoJSON " << layer.name << endl;
-					geoJSONProcessor.read(layers.layers[layerNum], layerNum);
 				} else {
-					cout << "Reading shapefile " << layer.name << endl;
-					shpProcessor.read(layers.layers[layerNum], layerNum);
+					try {
+						if (ends_with(layer.source, "json") || ends_with(layer.source, "jsonl") || ends_with(layer.source, "JSON") || ends_with(layer.source, "JSONL") || ends_with(layer.source, "jsonseq") || ends_with(layer.source, "JSONSEQ")) {
+							cout << "Reading GeoJSON " << layer.name << endl;
+							geoJSONProcessor.read(layers.layers[layerNum], layerNum);
+						} else {
+							cout << "Reading shapefile " << layer.name << endl;
+							shpProcessor.read(layers.layers[layerNum], layerNum);
+						}
+					} catch (const std::exception& e) {
+						cerr << "Error reading external source " << layer.source << ": " << e.what() << endl;
+						return -1;
+					} catch (...) {
+						cerr << "Unknown error reading external source " << layer.source << endl;
+						return -1;
+					}
 				}
 			}
 		}
@@ -315,7 +339,7 @@ int main(const int argc, const char* argv[]) {
 			[&]() {
 				thread_local std::pair<std::string, std::shared_ptr<OsmLuaProcessing>> osmLuaProcessing;
 				if (osmLuaProcessing.first != inputFile) {
-					osmLuaProcessing = std::make_pair(inputFile, std::make_shared<OsmLuaProcessing>(osmStore, config, layers, options.luaFile, shpMemTiles, osmMemTiles, attributeStore, options.osm.materializeGeometries, false));
+					osmLuaProcessing = std::make_pair(inputFile, std::make_shared<OsmLuaProcessing>(osmStore, config, layers, options.luaFile, shpMemTiles, osmMemTiles, attributeStore, declutter, options.osm.materializeGeometries, false));
 				}
 				return osmLuaProcessing.second;
 			},
@@ -356,6 +380,9 @@ int main(const int argc, const char* argv[]) {
 
 	// Loop through tiles
 	std::atomic<uint64_t> tilesWritten(0), lastTilesWritten(0);
+
+	// Rank any decluttered point features, and index them at their allotted zoom levels
+	declutter.apply(layers.layers, osmMemTiles, shpMemTiles);
 
 	for (auto source : sources) {
 		source->finalize(options.threadNum);
@@ -564,4 +591,3 @@ int main(const int argc, const char* argv[]) {
 
 	cout << endl << "Filled the tileset with good things at " << sharedData.outputFile << endl;
 }
-

@@ -38,15 +38,14 @@ private:
 	void fillPointArrayFromShapefile(std::vector<Point> *points, SHPObject *shape, uint part);
 
 	// Read requested attributes from a shapefile, and encode into an OutputObject
-	AttributeIndex readShapefileAttributes(DBFHandle &dbf, int recordNum, 
+	AttributeIndex readShapefileAttributes(DBFHandle dbf, int recordNum,
 	                                       std::unordered_map<int,std::string> &columnMap,
 	                                       std::unordered_map<int,int> &columnTypeMap,
-	                                       LayerDef &layer, uint &minzoom);
+	                                       LayerDef &layer, uint &minzoom, int32_t &score);
 
 	// Process an individual shapefile record
 	void processShapeGeometry(SHPObject* shape, AttributeIndex attrIdx, 
-	                          const LayerDef &layer, uint layerNum, bool hasName, const std::string &name);
+	                          const LayerDef &layer, uint layerNum, bool hasName, const std::string &name, int32_t score);
 };
 
 #endif //_SHP_PROCESSOR_H
-

@@ -1,5 +1,6 @@
 #include <iostream>
 #include <set>
+#include <unordered_set>
 
 #include "osm_lua_processing.h"
 #include "attribute_store.h"
@@ -19,7 +20,7 @@ const std::string EMPTY_STRING = "";
 thread_local kaguya::State *g_luaState = nullptr;
 thread_local OsmLuaProcessing* osmLuaProcessing = nullptr;
 
-std::mutex vectorLayerMetadataMutex;
+std::deque<std::mutex> vectorLayerMetadataMutexes;
 std::unordered_map<std::string, std::string> OsmLuaProcessing::dataStore;
 std::mutex OsmLuaProcessing::dataStoreMutex;
 
@@ -196,6 +197,7 @@ void rawLayerAsCentroid(const std::string &layerName, kaguya::VariadicArgType no
 bool rawLayerAsOffsetCurve(const std::string &layerName, kaguya::LuaTable options) { return osmLuaProcessing->LayerAsOffsetCurve(layerName, options); }
 void rawMinZoom(const double z) { return osmLuaProcessing->MinZoom(z); }
 void rawZOrder(const double z) { return osmLuaProcessing->ZOrder(z); }
+void rawScore(const double score) { return osmLuaProcessing->Score(score); }
 OsmLuaProcessing::OptionalRelation rawNextRelation() { return osmLuaProcessing->NextRelation(); }
 void rawRestartRelations() { return osmLuaProcessing->RestartRelations(); }
 std::string rawFindInRelation(const std::string& key) { return osmLuaProcessing->FindInRelation(key); }
@@ -232,18 +234,23 @@ OsmLuaProcessing::OsmLuaProcessing(
 	const class ShpMemTiles &shpMemTiles, 
 	class OsmMemTiles &osmMemTiles,
 	AttributeStore &attributeStore,
+	class Declutter &declutter,
 	bool materializeGeometries,
 	bool isFirst) :
 	osmStore(osmStore),
 	shpMemTiles(shpMemTiles),
 	osmMemTiles(osmMemTiles),
 	attributeStore(attributeStore),
+	declutter(declutter),
 	config(configIn),
 	currentTags(NULL),
 	layers(layers),
 	materializeGeometries(materializeGeometries) {
 
 	sigusr1Handler.initialize();
+	if (vectorLayerMetadataMutexes.size() <= layers.layers.size()) {
+		vectorLayerMetadataMutexes.resize(layers.layers.size() + 1);
+	}
 
 	// ----	Initialise Lua
 	g_luaState = &luaState;
@@ -292,6 +299,7 @@ OsmLuaProcessing::OsmLuaProcessing(
 
 	luaState["MinZoom"] = &rawMinZoom;
 	luaState["ZOrder"] = &rawZOrder;
+	luaState["Score"] = &rawScore;
 	luaState["Accept"] = &rawAccept;
 	luaState["NextRelation"] = &rawNextRelation;
 	luaState["RestartRelations"] = &rawRestartRelations;
@@ -516,21 +524,43 @@ void reverse_project(DegPoint& p) {
     geom::set<1>(p, latp2lat(geom::get<1>(p)));
 }
 
+template <typename DstRing, typename SrcRing>
+void projectRing(DstRing& dst, const SrcRing& src) {
+	dst.resize(src.size());
+	for (std::size_t i = 0; i < src.size(); ++i) {
+		geom::set<0>(dst[i], geom::get<0>(src[i]));
+		geom::set<1>(dst[i], latp2lat(geom::get<1>(src[i])));
+	}
+}
+
+#if BOOST_VERSION >= 106700
+double OsmLuaProcessing::projectedPolygonArea(const Polygon &p) {
+	areaPolygonCache.inners().resize(p.inners().size());
+	projectRing(areaPolygonCache.outer(), p.outer());
+	for (std::size_t i = 0; i < p.inners().size(); ++i) {
+		projectRing(areaPolygonCache.inners()[i], p.inners()[i]);
+	}
+
+	geom::strategy::area::spherical<> sph_strategy(RadiusMeter);
+	return geom::area(areaPolygonCache, sph_strategy);
+}
+#endif
+
 // Returns area
 double OsmLuaProcessing::Area() {
 	if (!IsClosed()) return 0;
 
 #if BOOST_VERSION >= 106700
-	geom::strategy::area::spherical<> sph_strategy(RadiusMeter);
 	if (isRelation) {
 		// Boost won't calculate area of a multipolygon, so we just total up the member polygons
-		return multiPolygonArea(multiPolygonCached());
+		double totalArea = 0;
+		const MultiPolygon &mp = multiPolygonCached();
+		for (MultiPolygon::const_iterator it = mp.begin(); it != mp.end(); ++it) {
+			totalArea += projectedPolygonArea(*it);
+		}
+		return totalArea;
 	} else if (isWay) {
-		// Reproject back into lat/lon and then run Boo
-		geom::model::polygon<DegPoint> p;
-		geom::assign(p,polygonCached());
-		geom::for_each_point(p, reverse_project);
-		return geom::area(p, sph_strategy);
+		return projectedPolygonArea(polygonCached());
 	}
 #else
 	if (isRelation) {
@@ -635,6 +665,7 @@ void OsmLuaProcessing::Layer(const string &layerName, bool area) {
 				id = osmMemTiles.storePoint(p);
 			OutputObject oo(geomType, layers.layerMap[layerName], id, 0, layerMinZoom);
 			outputs.push_back(std::make_pair(std::move(oo), attributes));
+			noteIfDecluttered(LatpLon { latp, lon });
 			return;
 		}
 		else if (geomType==POLYGON_) {
@@ -656,10 +687,12 @@ void OsmLuaProcessing::Layer(const string &layerName, bool area) {
 			}
 			else if (isWay) {
 				//Is there a more efficient way to do this?
-				Linestring ls = linestringCached();
+				const Linestring &ls = linestringCached();
 				Polygon p;
+				p.outer().reserve(ls.size());
 				geom::assign_points(p, ls);
-				mp.push_back(p);
+				mp.reserve(1);
+				mp.push_back(std::move(p));
 
 				auto correctionResult = CorrectGeometry(mp);
 				if(correctionResult == CorrectGeometryResult::Invalid) return;
@@ -836,6 +869,14 @@ void OsmLuaProcessing::LayerAsCentroid(const string &layerName, kaguya::Variadic
 	}
 	OutputObject oo(POINT_, layers.layerMap[layerName], id, 0, layerMinZoom);
 	outputs.push_back(std::make_pair(std::move(oo), attributes));
+	noteIfDecluttered(LatpLon { (int32_t)geomp.y(), (int32_t)geomp.x() });
+}
+
+// If the layer we've just written a point to is decluttered, remember where the point is:
+// it'll be held back from the tile index until all features have been read and ranked.
+void OsmLuaProcessing::noteIfDecluttered(LatpLon point) {
+	if (!declutter.isDecluttered(outputs.back().first.layer)) return;
+	declutterOutputs.push_back({ (uint32_t)(outputs.size() - 1), point, 0 });
 }
 
 // LayerAsOffsetCurve(layerName, options_table)
@@ -1028,8 +1069,10 @@ Point OsmLuaProcessing::calculateCentroid(CentroidAlgorithm algorithm) {
 				geom::centroid(ls, centroid);
 			}
 		} else {
+			const Linestring &ls = linestringCached();
 			Polygon p;
-			geom::assign_points(p, linestringCached());
+			p.outer().reserve(ls.size());
+			geom::assign_points(p, ls);
 
 			if (algorithm == CentroidAlgorithm::Polylabel) {
 				// CONSIDER: pick precision intelligently
@@ -1131,6 +1174,16 @@ void OsmLuaProcessing::MinZoom(const double z) {
 	outputs.back().first.setMinZoom(z);
 }
 
+// Set the score used to rank this feature against its neighbours when decluttering
+void OsmLuaProcessing::Score(const double score) {
+	if (outputs.size()==0) { ProcessingError("Can't set score if no Layer set"); return; }
+	if (declutterOutputs.empty() || declutterOutputs.back().outputIndex != outputs.size()-1) {
+		ProcessingError("Score() only applies to point features in a layer with declutter_below set");
+		return;
+	}
+	declutterOutputs.back().score = OutputObject::finite_cast<int32_t>(score);
+}
+
 // Set z_order
 void OsmLuaProcessing::ZOrder(const double z) {
 	if (outputs.size()==0) { ProcessingError("Can't set z_order if no Layer set"); return; }
@@ -1187,9 +1240,14 @@ std::string OsmLuaProcessing::FindInRelation(const std::string &key) {
 }
 
 // Record attribute name/type for vector_layers table
+thread_local std::vector<std::unordered_set<std::string>> alreadySeen;
+
 void OsmLuaProcessing::setVectorLayerMetadata(const uint_least8_t layer, const string &key, const uint type) {
-	std::lock_guard<std::mutex> lock(vectorLayerMetadataMutex);
+	if (alreadySeen.size() <= layer) alreadySeen.resize(layer + 1);
+	if (alreadySeen[layer].count(key)) return;
+	std::lock_guard<std::mutex> lock(vectorLayerMetadataMutexes[layer]);
 	layers.layers[layer].attributeMap[key] = type;
+	alreadySeen[layer].insert(key);
 }
 
 // Scan relation (but don't write geometry)
@@ -1619,9 +1677,17 @@ SignificantTags OsmLuaProcessing::GetSignificantWayKeys() {
 std::vector<OutputObject> OsmLuaProcessing::finalizeOutputs() {
 	std::vector<OutputObject> list;
 	list.reserve(this->outputs.size());
-	for (auto jt = this->outputs.begin(); jt != this->outputs.end(); ++jt) {
-		jt->first.setAttributeSet(attributeStore.add(jt->second));
-		list.push_back(jt->first);
+	size_t nextDeclutter = 0;
+	for (size_t i = 0; i < this->outputs.size(); i++) {
+		auto& output = this->outputs[i];
+		output.first.setAttributeSet(attributeStore.add(output.second));
+		if (nextDeclutter < declutterOutputs.size() && declutterOutputs[nextDeclutter].outputIndex == i) {
+			// Park it: Declutter::apply() will set its minimum zoom and index it later
+			const auto& pending = declutterOutputs[nextDeclutter++];
+			declutter.add(output.first, pending.point, originalOsmID, pending.score, false);
+			continue;
+		}
+		list.push_back(output.first);
 	}
 	return list;
 }

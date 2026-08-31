@@ -2,11 +2,31 @@
 
 #include <boost/asio/thread_pool.hpp>
 #include <boost/asio/post.hpp>
+#include <exception>
+#include <memory>
+#include <type_traits>
 
 extern bool verbose;
 
 using namespace std;
 namespace geom = boost::geometry;
+
+namespace {
+	struct ShpHandleCloser {
+		void operator()(SHPHandle shp) const {
+			SHPClose(shp);
+		}
+	};
+
+	struct DbfHandleCloser {
+		void operator()(DBFHandle dbf) const {
+			DBFClose(dbf);
+		}
+	};
+
+	using ShpHandlePtr = std::unique_ptr<std::remove_pointer<SHPHandle>::type, ShpHandleCloser>;
+	using DbfHandlePtr = std::unique_ptr<std::remove_pointer<DBFHandle>::type, DbfHandleCloser>;
+}
 
 /*
 	Read shapefiles into Boost geometries
@@ -30,16 +50,15 @@ void ShpProcessor::fillPointArrayFromShapefile(vector<Point> *points, SHPObject 
 			prevx = x[i];
 			prevy = latp;
 		}
-		points->emplace_back(geom::make<Point>(x[i], lat2latp(y[i])));
 	}
 }
 
 // Read requested attributes from a shapefile, and encode into an OutputObject
 // columnTypeMap: 0 string, 1 int, 2 double, 3 boolean
 AttributeIndex ShpProcessor::readShapefileAttributes(
-		DBFHandle &dbf,
+		DBFHandle dbf,
 		int recordNum, unordered_map<int,string> &columnMap, unordered_map<int,int> &columnTypeMap,
-		LayerDef &layer, uint &minzoom) {
+		LayerDef &layer, uint &minzoom, int32_t &score) {
 
 	std::lock_guard<std::mutex> lock(attributeMutex);
 	AttributeStore& attributeStore = osmLuaProcessing.getAttributeStore();
@@ -70,6 +89,7 @@ AttributeIndex ShpProcessor::readShapefileAttributes(
 				layer.attributeMap[key] = 0;
 			} else if (val.isType<int>()) {
 				if (key=="_minzoom") { minzoom=val; continue; }
+				if (key=="_score") { score=val; continue; }
 				attributeStore.addAttribute(attributes, key, (int)val, 0);
 				layer.attributeMap[key] = 1;
 			} else if (val.isType<double>()) {
@@ -114,39 +134,42 @@ void ShpProcessor::read(class LayerDef &layer, uint layerNum)
 	const string &indexName = layer.indexName;
 
 	// open shapefile
-	SHPHandle shp = SHPOpen(filename.c_str(), "rb");
-	DBFHandle dbf = DBFOpen(filename.c_str(), "rb");
+	ShpHandlePtr shp(SHPOpen(filename.c_str(), "rb"));
+	DbfHandlePtr dbf(DBFOpen(filename.c_str(), "rb"));
 	if(shp == nullptr || dbf == nullptr)
 		return;
 	int numEntities=0, shpType=0;
 	double adfMinBound[4], adfMaxBound[4];
-	SHPGetInfo(shp, &numEntities, &shpType, adfMinBound, adfMaxBound);
+	SHPGetInfo(shp.get(), &numEntities, &shpType, adfMinBound, adfMaxBound);
 	
 	// prepare columns
 	unordered_map<int,string> columnMap;
 	unordered_map<int,int> columnTypeMap;
 	if (layer.allSourceColumns) {
-		for (size_t i=0; i<DBFGetFieldCount(dbf); i++) {
+		for (size_t i=0; i<DBFGetFieldCount(dbf.get()); i++) {
 			char name[12];
-			columnTypeMap[i] = DBFGetFieldInfo(dbf,i,name,NULL,NULL);
+			columnTypeMap[i] = DBFGetFieldInfo(dbf.get(),i,name,NULL,NULL);
 			columnMap[i] = string(name);
 		}
 	} else {
 		for (size_t i=0; i<columns.size(); i++) {
-			int dbfLoc = DBFGetFieldIndex(dbf,columns[i].c_str());
+			int dbfLoc = DBFGetFieldIndex(dbf.get(),columns[i].c_str());
 			if (dbfLoc>-1) { 
 				columnMap[dbfLoc]=columns[i];
-				columnTypeMap[dbfLoc]=DBFGetFieldInfo(dbf,dbfLoc,NULL,NULL,NULL);
+				columnTypeMap[dbfLoc]=DBFGetFieldInfo(dbf.get(),dbfLoc,NULL,NULL,NULL);
 			}
 		}
 	}
 	int indexField=-1;
-	if (indexName!="") { indexField = DBFGetFieldIndex(dbf,indexName.c_str()); }
+	if (indexName!="") { indexField = DBFGetFieldIndex(dbf.get(),indexName.c_str()); }
 
+	std::exception_ptr error;
+	std::mutex errorMutex;
 	boost::asio::thread_pool pool(threadNum);
 	for (int i=0; i<numEntities; i++) {
-		SHPObject* shape = SHPReadObject(shp, i);
-		if(shape == nullptr) { cerr << "Error loading shape from shapefile" << endl; continue; }
+		SHPObject* rawShape = SHPReadObject(shp.get(), i);
+		if(rawShape == nullptr) { cerr << "Error loading shape from shapefile" << endl; continue; }
+		std::shared_ptr<SHPObject> shape(rawShape, SHPDestroyObject);
 
 		// Check shape is in clippingBox
 		Box shapeBox(Point(shape->dfXMin, lat2latp(shape->dfYMin)), Point(shape->dfXMax, lat2latp(shape->dfYMax)));
@@ -154,31 +177,36 @@ void ShpProcessor::read(class LayerDef &layer, uint layerNum)
 		    shapeBox.max_corner().get<0>() < clippingBox.min_corner().get<0>() ||
 		    shapeBox.min_corner().get<1>() > clippingBox.max_corner().get<1>() ||
 		    shapeBox.max_corner().get<1>() < clippingBox.min_corner().get<1>()) {
-			SHPDestroyObject(shape);
 			continue;
 		}
 
 		boost::asio::post(pool, [&, i, shape]() {
-			// process attributes
-			string name;
-			bool hasName = false;
-			if (indexField>-1) { 
-				std::lock_guard<std::mutex> lock(attributeMutex);
-				name=DBFReadStringAttribute(dbf, i, indexField); hasName = true;
+			try {
+				// process attributes
+				string name;
+				bool hasName = false;
+				if (indexField>-1) {
+					std::lock_guard<std::mutex> lock(attributeMutex);
+					name=DBFReadStringAttribute(dbf.get(), i, indexField); hasName = true;
+				}
+				int32_t score = 0;
+				AttributeIndex attrIdx = readShapefileAttributes(dbf.get(), i, columnMap, columnTypeMap, layer, layer.minzoom, score);
+				// process geometry
+				processShapeGeometry(shape.get(), attrIdx, layer, layerNum, hasName, name, score);
+			} catch (...) {
+				std::lock_guard<std::mutex> lock(errorMutex);
+				if (!error)
+					error = std::current_exception();
 			}
-			AttributeIndex attrIdx = readShapefileAttributes(dbf, i, columnMap, columnTypeMap, layer, layer.minzoom);
-			// process geometry
-			processShapeGeometry(shape, attrIdx, layer, layerNum, hasName, name);
-			SHPDestroyObject(shape);
 		});
 	}
 	pool.join();
-	SHPClose(shp);
-	DBFClose(dbf);
+	if (error)
+		std::rethrow_exception(error);
 }
 
 void ShpProcessor::processShapeGeometry(SHPObject* shape, AttributeIndex attrIdx,
-                                        const LayerDef &layer, uint layerNum, bool hasName, const string &name) {
+                                        const LayerDef &layer, uint layerNum, bool hasName, const string &name, int32_t score) {
 	int shapeType = shape->nSHPType;	// 1=point, 3=polyline, 5=(multi)polygon [8=multipoint, 11+=3D]
 	int minzoom = layer.minzoom;
 
@@ -186,7 +214,7 @@ void ShpProcessor::processShapeGeometry(SHPObject* shape, AttributeIndex attrIdx
 		// Points
 		Point p( shape->padfX[0], lat2latp(shape->padfY[0]) );
 		if (geom::within(p, clippingBox)) {
-			shpMemTiles.StoreGeometry(layerNum, layer.name, POINT_, p, layer.indexed, hasName, name, minzoom, attrIdx);
+			shpMemTiles.StoreGeometry(layerNum, layer.name, POINT_, p, layer.indexed, hasName, name, minzoom, score, attrIdx);
 		}
 
 	} else if (shapeType==8 || shapeType==18 || shapeType==28) {
@@ -194,7 +222,7 @@ void ShpProcessor::processShapeGeometry(SHPObject* shape, AttributeIndex attrIdx
 		for (uint i=0; i<shape->nVertices; i++) {
 			Point p( shape->padfX[i], lat2latp(shape->padfY[i]) );
 			if (geom::within(p, clippingBox)) {
-				shpMemTiles.StoreGeometry(layerNum, layer.name, POINT_, p, layer.indexed, hasName, name, minzoom, attrIdx);
+				shpMemTiles.StoreGeometry(layerNum, layer.name, POINT_, p, layer.indexed, hasName, name, minzoom, score, attrIdx);
 			}
 		}
 
@@ -210,7 +238,7 @@ void ShpProcessor::processShapeGeometry(SHPObject* shape, AttributeIndex attrIdx
 			MultiLinestring out;
 			geom::intersection(ls, clippingBox, out);
 			for (MultiLinestring::const_iterator it = out.begin(); it != out.end(); ++it) {
-				shpMemTiles.StoreGeometry(layerNum, layer.name, LINESTRING_, *it, layer.indexed, hasName, name, minzoom, attrIdx);
+				shpMemTiles.StoreGeometry(layerNum, layer.name, LINESTRING_, *it, layer.indexed, hasName, name, minzoom, score, attrIdx);
 			}
 		}
 
@@ -269,7 +297,7 @@ void ShpProcessor::processShapeGeometry(SHPObject* shape, AttributeIndex attrIdx
 		MultiPolygon out;
 		geom::intersection(multi, clippingBox, out);
 		if (boost::size(out)>0) {
-			shpMemTiles.StoreGeometry(layerNum, layer.name, POLYGON_, out, layer.indexed, hasName, name, minzoom, attrIdx);
+			shpMemTiles.StoreGeometry(layerNum, layer.name, POLYGON_, out, layer.indexed, hasName, name, minzoom, score, attrIdx);
 		}
 
 	} else {

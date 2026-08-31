@@ -333,7 +333,8 @@ void Config::readConfig(rapidjson::Document &jsonConfig, bool &hasClippingBox, B
 		int    combinePolyBelow=it->value.HasMember("combine_polygons_below") ? it->value["combine_polygons_below"].GetInt() : 0;
 		bool sortZOrderAscending = it->value.HasMember("z_order_ascending") ? it->value["z_order_ascending"].GetBool() : (featureLimit==0);
 		string algo           = it->value.HasMember("simplify_algorithm") ? it->value["simplify_algorithm"].GetString() : "";
-		uint simplifyAlgo = algo=="visvalingam" ? LayerDef::VISVALINGAM : LayerDef::DOUGLAS_PEUCKER;
+		uint simplifyAlgo = algo=="visvalingam" ? LayerDef::VISVALINGAM : 
+		                    algo=="buildings"   ? LayerDef::BUILDINGS : LayerDef::DOUGLAS_PEUCKER;
 		string source = it->value.HasMember("source") ? it->value["source"].GetString() : "";
 		vector<string> sourceColumns;
 		bool allSourceColumns = false;
@@ -352,11 +353,24 @@ void Config::readConfig(rapidjson::Document &jsonConfig, bool &hasClippingBox, B
 		string indexName = it->value.HasMember("index_column") ? it->value["index_column"].GetString() : "";
 		bool buffer = it->value.HasMember("buffer") ? it->value["buffer"].GetBool() : true;  // Default: true
 
-		layers.addLayer(layerName, minZoom, maxZoom,
+		uint layerNum = layers.addLayer(layerName, minZoom, maxZoom,
 				simplifyBelow, simplifyLevel, simplifyLength, simplifyRatio, simplifyAlgo,
 				filterBelow, filterArea, sortZOrderAscending, featureLimit, featureLimitBelow, combinePoints, combineLinesBelow, combinePolyBelow,
 				source, sourceColumns, allSourceColumns, indexed, indexName,
 				writeTo, buffer);
+
+		// Decluttering (thinning out point features by the score their profile gives them)
+		if (it->value.HasMember("declutter_below")) {
+			LayerDef &layerDef = layers.layers[layerNum];
+			int declutterBelow = it->value["declutter_below"].GetInt();
+			if (declutterBelow > 15) {		// minZoom is a 4-bit field
+				cerr << "declutter_below in layer " << layerName << " capped at z15" << endl;
+				declutterBelow = 15;
+			}
+			layerDef.declutterBelow = declutterBelow;
+			if (it->value.HasMember("declutter_distance" )) layerDef.declutterDistance  = it->value["declutter_distance" ].GetDouble();
+			if (it->value.HasMember("declutter_threshold")) layerDef.declutterThreshold = it->value["declutter_threshold"].GetDouble();
+		}
 
 		cout << "Layer " << layerName << " (z" << minZoom << "-" << maxZoom << ")";
 		if (it->value.HasMember("write_to")) { cout << " -> " << it->value["write_to"].GetString(); }

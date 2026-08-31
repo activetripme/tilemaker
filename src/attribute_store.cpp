@@ -16,13 +16,12 @@ uint16_t AttributeKeyStore::key2index(const std::string& key) {
 
 	// Not found, ensure our local map is up-to-date for future calls,
 	// and fall through to the main map.
-	//
-	// Note that we can read `keys` without a lock
+	std::lock_guard<std::mutex> lock(keys2indexMutex);
 	while (tlsKeys2IndexSize < keys2indexSize) {
 		tlsKeys2IndexSize++;
 		tlsKeys2Index[&keys[tlsKeys2IndexSize]] = tlsKeys2IndexSize;
 	}
-	std::lock_guard<std::mutex> lock(keys2indexMutex);
+
 	const auto& rv = keys2index.find(&key);
 
 	if (rv != keys2index.end())
@@ -38,9 +37,9 @@ uint16_t AttributeKeyStore::key2index(const std::string& key) {
 	if (newIndex >= 512)
 		throw std::out_of_range("more than 512 unique keys");
 
-	keys2indexSize++;
 	keys.push_back(key);
 	keys2index[&keys[newIndex]] = newIndex;
+	keys2indexSize = newIndex;
 	return newIndex;
 }
 
@@ -101,8 +100,8 @@ const AttributePair& AttributePairStore::getPairUnsafe(uint32_t i) const {
 thread_local uint64_t tlsPairLookups = 0;
 thread_local uint64_t tlsPairLookupsUncached = 0;
 
-thread_local std::vector<const AttributePair*> cachedAttributePairPointers(64);
-thread_local std::vector<uint32_t> cachedAttributePairIndexes(64);
+thread_local std::vector<const AttributePair*> cachedAttributePairPointers(256);
+thread_local std::vector<uint32_t> cachedAttributePairIndexes(256);
 uint32_t AttributePairStore::addPair(AttributePair& pair, bool isHot) {
 	if (isHot) {
 		{
@@ -300,8 +299,8 @@ void AttributeSet::finalize() {
 
 // Remember recently queried/added sets so that we can return them in the
 // future without taking a lock.
-thread_local std::vector<const AttributeSet*> cachedAttributeSetPointers(64);
-thread_local std::vector<AttributeIndex> cachedAttributeSetIndexes(64);
+thread_local std::vector<const AttributeSet*> cachedAttributeSetPointers(256);
+thread_local std::vector<AttributeIndex> cachedAttributeSetIndexes(256);
 
 thread_local uint64_t tlsSetLookups = 0;
 thread_local uint64_t tlsSetLookupsUncached = 0;
